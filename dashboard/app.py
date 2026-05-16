@@ -2,8 +2,12 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import requests
+import os
 
-API_URL = "http://api:8000/predict-spike"
+API_URL = os.getenv(
+        "API_URL",
+        "http://127.0.0.1:8000/predict-spike"
+)
 
 st.set_page_config(
     page_title="Air Pollution Spike Prediction",
