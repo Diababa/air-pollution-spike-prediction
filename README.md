@@ -49,6 +49,23 @@ The system includes:
 
 ---
 
+# 📸 Dashboard Screenshots
+
+## Data Overview
+![Data Overview](assets/screenshots/overview.png)
+
+## Spike Analysis
+![Spike Analysis](assets/screenshots/spike_analysis.png)
+
+## Live Prediction
+![Live Prediction](assets/screenshots/live_prediction.png)
+
+## Explainability
+![Explainability](assets/screenshots/explainability.png)
+
+
+
+
 # 🏗️ System Architecture
 
 ```text
