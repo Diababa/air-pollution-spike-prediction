@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.express as px
 import requests
 
-API_URL = "https://TON_API_RENDER.onrender.com/predict-spike"
+API_URL = "http://api:8000/predict-spike"
 
 st.set_page_config(
     page_title="Air Pollution Spike Prediction",
