@@ -1,12 +1,9 @@
 services:
-
   api:
     build:
       context: .
       dockerfile: Dockerfile.api
-
     container_name: air_pollution_api
-
     ports:
       - "8000:8000"
 
@@ -14,11 +11,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dashboard
-
     container_name: air_pollution_dashboard
-
     ports:
       - "8501:8501"
-
+    environment:
+      - API_URL=http://api:8000/predict-spike
     depends_on:
       - api
