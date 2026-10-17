@@ -351,7 +351,8 @@ latest version **only if, on the current test set**, it beats:
    retraining).
 
 The decision and the scores behind it are stored as tags on the model version. A
-promoted model is also exported to `models/*.pkl`, which the API serves on Render.
+promoted model is also exported to `models/*.json` (XGBoost's native, version-stable
+format, rather than a pickle), which the API serves on Render.
 With `MODEL_SOURCE=mlflow`, the API loads the champion straight from the registry.
 
 > **Current status, stated honestly:** the spike classifier is promoted. The
@@ -476,8 +477,8 @@ ml-project/
 │   └── processed/                   # Feature-engineered dataset
 │
 ├── models/
-│   ├── xgboost_pm25_48h.pkl         # Regressor: PM2.5 in 48h
-│   └── xgboost_spike_classifier.pkl # Classifier: spike in 48h
+│   ├── xgboost_pm25_48h.json         # Regressor: PM2.5 in 48h
+│   └── xgboost_spike_classifier.json # Classifier: spike in 48h
 │
 ├── reports/
 │   └── baseline_comparison.md       # Generated metric comparison

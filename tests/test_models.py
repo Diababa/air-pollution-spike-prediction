@@ -5,22 +5,19 @@ Deux invariants protègent des deux bugs déjà rencontrés :
 2. aucun modèle n'utilise une colonne dérivée de la cible (fuite de cible).
 """
 
-import joblib
 import pytest
 
 from src.api.app import PollutionFeatures
+from src.models.common import load_classifier, load_regressor
 
 LEAKING_COLUMNS = {"target_pm25_48h", "spike_48h"}
 
-MODEL_PATHS = [
-    "models/xgboost_pm25_48h.pkl",
-    "models/xgboost_spike_classifier.pkl",
-]
+MODEL_LOADERS = [load_regressor, load_classifier]
 
 
-@pytest.fixture(params=MODEL_PATHS)
+@pytest.fixture(params=MODEL_LOADERS, ids=["regressor", "classifier"])
 def model(request):
-    return joblib.load(request.param)
+    return request.param()
 
 
 def test_model_features_match_api_schema(model):

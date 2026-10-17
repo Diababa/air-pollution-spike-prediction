@@ -3,18 +3,24 @@ import os
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-import joblib
 import pandas as pd
+
+from src.models.common import (
+    CLASSIFIER_PATH,
+    REGRESSOR_PATH,
+    load_classifier,
+    load_regressor,
+)
 
 
 # ---------------------------------------------------
 # Charger modèles
 # ---------------------------------------------------
-# Par défaut : fichiers .pkl exportés par src/models/promote.py (déploiement
+# Par défaut : fichiers JSON exportés par src/models/promote.py (déploiement
 # Render, sans serveur MLflow). Avec MODEL_SOURCE=mlflow : chargement direct
 # de la version « champion » depuis le Model Registry.
 
-def load_model(registered_name, fallback_path):
+def load_model(registered_name, load_fallback):
     if os.getenv("MODEL_SOURCE") == "mlflow":
         import mlflow.xgboost
         from mlflow.exceptions import MlflowException
@@ -23,12 +29,12 @@ def load_model(registered_name, fallback_path):
         except MlflowException as exc:
             # Aucun champion (ex. le modèle n'a jamais battu les baselines) :
             # on garde le dernier modèle exporté plutôt que de bloquer l'API.
-            print(f"[{registered_name}] pas de champion MLflow ({exc}), repli sur {fallback_path}")
-    return joblib.load(fallback_path)
+            print(f"[{registered_name}] pas de champion MLflow ({exc}), repli sur le fichier exporté")
+    return load_fallback()
 
 
-regression_model = load_model("pm25-48h-regressor", "models/xgboost_pm25_48h.pkl")
-classifier_model = load_model("pm25-spike-classifier", "models/xgboost_spike_classifier.pkl")
+regression_model = load_model("pm25-48h-regressor", lambda: load_regressor(REGRESSOR_PATH))
+classifier_model = load_model("pm25-spike-classifier", lambda: load_classifier(CLASSIFIER_PATH))
 
 
 # ---------------------------------------------------

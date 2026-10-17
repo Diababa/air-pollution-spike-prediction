@@ -21,20 +21,21 @@ Usage : python -m src.models.baseline
 """
 
 import numpy as np
-import joblib
 
 from src.models.common import (
+    CLASSIFIER_PATH,
+    REGRESSOR_PATH,
     SPIKE_THRESHOLD_PROBA,
     TRAIN_RATIO,
     chronological_split,
     classification_scores,
     feature_columns,
+    load_classifier,
     load_data,
+    load_regressor,
     regression_scores,
 )
 
-REGRESSOR_PATH = "models/xgboost_pm25_48h.pkl"
-CLASSIFIER_PATH = "models/xgboost_spike_classifier.pkl"
 REPORT_PATH = "reports/baseline_comparison.md"
 
 SPIKE_QUANTILE = 0.90  # identique a src/data/transformation.py
@@ -81,13 +82,13 @@ def evaluate(df):
     y_test = test["target_pm25_48h"]
 
     regression = regression_baselines(train, test)
-    regressor = joblib.load(REGRESSOR_PATH)
+    regressor = load_regressor(REGRESSOR_PATH)
     regression["XGBoost Regressor"] = regression_scores(
         y_test, regressor.predict(test[cols])
     )
 
     classification = classification_baselines(df, test)
-    classifier = joblib.load(CLASSIFIER_PATH)
+    classifier = load_classifier(CLASSIFIER_PATH)
     probs = classifier.predict_proba(test[cols])[:, 1]
     classification["XGBoost Classifier (threshold 0.30)"] = classification_scores(
         test["spike_48h"], (probs >= SPIKE_THRESHOLD_PROBA).astype(int)

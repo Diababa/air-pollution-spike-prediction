@@ -58,3 +58,31 @@ def classification_scores(y_true, y_pred):
         "Recall": float(recall_score(y_true, y_pred, zero_division=0)),
         "F1": float(f1_score(y_true, y_pred, zero_division=0)),
     }
+
+
+# ---------------------------------------------------------------------
+# Sauvegarde des modèles
+# ---------------------------------------------------------------------
+# Format JSON natif d'XGBoost plutôt que pickle : un pickle fige l'objet
+# Python de la version qui l'a écrit, et une autre version d'XGBoost peut le
+# relire mal ou plus du tout. Le JSON est le format de sauvegarde officiel,
+# stable d'une version à l'autre.
+
+REGRESSOR_PATH = "models/xgboost_pm25_48h.json"
+CLASSIFIER_PATH = "models/xgboost_spike_classifier.json"
+
+
+def load_regressor(path=REGRESSOR_PATH):
+    from xgboost import XGBRegressor
+
+    model = XGBRegressor()
+    model.load_model(path)
+    return model
+
+
+def load_classifier(path=CLASSIFIER_PATH):
+    from xgboost import XGBClassifier
+
+    model = XGBClassifier()
+    model.load_model(path)
+    return model

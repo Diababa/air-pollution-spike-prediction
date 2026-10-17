@@ -7,18 +7,20 @@ devient « champion » seulement si, sur le jeu de test ACTUEL,
      comparer à une métrique enregistrée sur une ancienne fenêtre de test
      serait biaisé, puisque la fenêtre se déplace à chaque réentraînement).
 
-Si elle est promue, elle est aussi exportée en .pkl pour l'API.
+Si elle est promue, elle est aussi exportée en JSON (format natif XGBoost)
+pour l'API.
 Sinon, rien ne change en production et la décision est tracée sur la
 version dans le Model Registry (tags promotion_*).
 
 Usage : python -m src.models.promote
 """
 
-import joblib
 import mlflow.xgboost
 
 from src.models.baseline import classification_baselines, regression_baselines
 from src.models.common import (
+    CLASSIFIER_PATH,
+    REGRESSOR_PATH,
     SPIKE_THRESHOLD_PROBA,
     chronological_split,
     classification_scores,
@@ -29,8 +31,8 @@ from src.models.common import (
 from src.tracking import CHAMPION_ALIAS, CLASSIFIER_NAME, REGRESSOR_NAME, setup_mlflow
 
 EXPORT_PATHS = {
-    REGRESSOR_NAME: "models/xgboost_pm25_48h.pkl",
-    CLASSIFIER_NAME: "models/xgboost_spike_classifier.pkl",
+    REGRESSOR_NAME: REGRESSOR_PATH,
+    CLASSIFIER_NAME: CLASSIFIER_PATH,
 }
 
 
@@ -105,7 +107,7 @@ def promote(name, client, df):
 
     if promoted:
         client.set_registered_model_alias(name, CHAMPION_ALIAS, candidate.version)
-        joblib.dump(cand_model, EXPORT_PATHS[name])
+        cand_model.save_model(EXPORT_PATHS[name])
         print(f"[{name}] exporté vers {EXPORT_PATHS[name]}")
     return promoted
 

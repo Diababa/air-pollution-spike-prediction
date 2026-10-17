@@ -1,6 +1,7 @@
 import pandas as pd
-import joblib
 import shap
+
+from src.models.common import load_classifier
 
 
 def generate_feature_importance():
@@ -12,7 +13,7 @@ def generate_feature_importance():
         "spike_48h"
     ])
 
-    model = joblib.load("models/xgboost_spike_classifier.pkl")
+    model = load_classifier()
 
     # On limite l'échantillon pour éviter que SHAP soit trop lent
     X_sample = X.sample(n=min(2000, len(X)), random_state=42)
