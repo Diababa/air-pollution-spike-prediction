@@ -411,6 +411,7 @@ ml-project/
 ├── Dockerfile.api
 ├── Dockerfile.dashboard
 ├── docker-compose.yml
+├── pytest.ini
 ├── requirements.txt
 ├── requirements-dev.txt
 └── README.md
