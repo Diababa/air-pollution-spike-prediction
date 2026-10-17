@@ -365,7 +365,7 @@ With `MODEL_SOURCE=mlflow`, the API loads the champion straight from the registr
 [`dags/air_pollution_pipeline.py`](dags/air_pollution_pipeline.py):
 
 ```
-ingest → transform → validate → [train_regressor, train_classifier] → baseline_report → [promote_regressor, promote_classifier]
+ingest → transform → validate → [train_regressor, train_classifier] → [promote_regressor, promote_classifier] → baseline_report
 ```
 
 * **Reproducible ingestion:** a 3-year sliding window anchored on the run's logical
@@ -574,8 +574,8 @@ streamlit run dashboard/app.py
 python -m src.data.transformation      # build the feature dataset
 python -m src.models.train             # train the regressor
 python -m src.models.train_classifier  # train the spike classifier
-python -m src.models.baseline          # compare models vs naive baselines
 python -m src.models.promote           # promote to "champion" only if better
+python -m src.models.baseline          # compare served models vs naive baselines
 python -m src.models.explainability    # compute SHAP feature importance
 ```
 

@@ -8,9 +8,11 @@
    ordre chronologique). Le pipeline s'arrête ici si les données sont mauvaises.
 4. **train_regressor / train_classifier** (en parallèle) : runs MLflow,
    nouvelles versions candidates dans le Model Registry.
-5. **baseline_report** : rapport de comparaison aux baselines naïves.
-6. **promote_regressor / promote_classifier** : alias « champion » donné
-   uniquement si la version bat les baselines ET le champion en place.
+5. **promote_regressor / promote_classifier** : alias « champion » donné
+   uniquement si la version bat les baselines ET le champion en place ;
+   le champion est exporté pour l'API.
+6. **baseline_report** : rapport de comparaison aux baselines, généré APRÈS
+   la promotion pour décrire les modèles réellement servis par l'API.
 
 Hebdomadaire plutôt que quotidien : une semaine de données nouvelles sur
 3 ans d'historique (environ 0,6 %) ne justifie pas un réentraînement par jour.
@@ -105,8 +107,8 @@ def air_pollution_retraining():
         transform(),
         validate(),
         [train_regressor(), train_classifier()],
-        baseline_report(),
         [promote_regressor(), promote_classifier()],
+        baseline_report(),
     )
 
 

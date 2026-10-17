@@ -26,6 +26,8 @@ def test_dag_structure():
     assert upstream["validate"] == {"transform"}
     assert upstream["train_regressor"] == {"validate"}
     assert upstream["train_classifier"] == {"validate"}
-    # Aucune promotion sans rapport de baselines à jour
-    assert upstream["promote_regressor"] == {"baseline_report"}
-    assert upstream["promote_classifier"] == {"baseline_report"}
+    # Chaque promotion attend l'entraînement de SON modèle
+    assert upstream["promote_regressor"] == {"train_regressor"}
+    assert upstream["promote_classifier"] == {"train_classifier"}
+    # Le rapport décrit les modèles servis : il vient APRÈS la promotion
+    assert upstream["baseline_report"] == {"promote_regressor", "promote_classifier"}
