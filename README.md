@@ -317,8 +317,86 @@ during development:
 * the features expected by each saved model must match the API schema exactly;
 * no model may consume a column derived from the target.
 
+It also checks the promotion rule (including the real case of the current regressor,
+which must not be promoted), the reproducibility of the ingestion window and, when
+Airflow is installed, the structure of the DAG.
+
 [GitHub Actions](.github/workflows/ci-cd.yml) runs the tests, regenerates the
 baseline comparison and builds both Docker images on every push to `main`.
+
+---
+
+# 🔁 MLOps: MLflow Tracking & Airflow Orchestration
+
+## Experiment tracking & Model Registry (MLflow)
+
+Every training run is logged to MLflow:
+
+* hyperparameters, training / test periods and dataset sizes;
+* test metrics (MAE / RMSE / R² for the regressor, precision / recall / F1 and the
+  confusion matrix for the classifier);
+* **the naive baselines computed on the same test set, in the same run**, plus a
+  `beats_best_baseline_*` tag, so no metric is ever read without its reference;
+* the model itself, with its input signature, registered as a new **candidate
+  version** in the Model Registry (`pm25-48h-regressor`, `pm25-spike-classifier`).
+
+## Promotion rule
+
+[`src/models/promote.py`](src/models/promote.py) gives the `champion` alias to the
+latest version **only if, on the current test set**, it beats:
+
+1. the best naive baseline, and
+2. the current champion, re-evaluated on that same test set (a metric logged on an
+   older test window would not be comparable, since the window moves with each
+   retraining).
+
+The decision and the scores behind it are stored as tags on the model version. A
+promoted model is also exported to `models/*.pkl`, which the API serves on Render.
+With `MODEL_SOURCE=mlflow`, the API loads the champion straight from the registry.
+
+> **Current status, stated honestly:** the spike classifier is promoted. The
+> regressor is **not**: its MAE does not beat the climatology baseline (see
+> [Results vs baselines](#results-vs-baselines)), so the rule keeps it out of
+> production. The regression endpoint still serves the last exported model.
+
+## Weekly retraining (Airflow)
+
+[`dags/air_pollution_pipeline.py`](dags/air_pollution_pipeline.py):
+
+```
+ingest → transform → validate → [train_regressor, train_classifier] → baseline_report → [promote_regressor, promote_classifier]
+```
+
+* **Reproducible ingestion:** a 3-year sliding window anchored on the run's logical
+  date (minus 7 days, the delay before Open-Meteo's weather archive is consolidated),
+  so any past run can be replayed on exactly the same data.
+* **Quality gate:** `validate` has no retries; bad data stops the pipeline before
+  any model is trained.
+* **Weekly, not daily:** one new week on three years of history (~0.6 % of the data)
+  does not justify daily retraining.
+
+## Run the MLOps stack locally
+
+```bash
+docker compose -f docker-compose.mlops.yml up --build
+```
+
+| Service | URL |
+| ------- | --- |
+| MLflow UI | http://localhost:5000 |
+| Airflow UI | http://localhost:8080 |
+
+Airflow runs in `standalone` mode: the generated admin password is printed in the logs
+(`docker compose -f docker-compose.mlops.yml logs airflow | grep -i password`).
+On Linux, run `echo "AIRFLOW_UID=$(id -u)" >> .env` first so that files written to the
+mounted project belong to your user. Airflow is not deployed on Render: the free
+tier cannot host a scheduler.
+
+Without Docker, MLflow falls back to a local SQLite store (`mlflow.db`):
+
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
 
 ---
 
@@ -377,6 +455,8 @@ Free tier, so expect the cold start described in the [Live Demo](#-live-demo) se
 * Docker Compose
 * Render
 * GitHub Actions
+* MLflow (tracking & Model Registry)
+* Apache Airflow
 
 ---
 
@@ -384,6 +464,9 @@ Free tier, so expect the cold start described in the [Live Demo](#-live-demo) se
 
 ```text
 ml-project/
+│
+├── dags/
+│   └── air_pollution_pipeline.py    # Airflow DAG: weekly retraining
 │
 ├── dashboard/
 │   └── app.py                       # Streamlit UI
@@ -402,18 +485,23 @@ ml-project/
 ├── src/
 │   ├── api/app.py                   # FastAPI service
 │   ├── data/                        # Ingestion, validation, transformation
-│   └── models/                      # train, train_classifier, baseline, explainability
+│   ├── models/                      # train, train_classifier, baseline, promote, explainability
+│   └── tracking.py                  # MLflow configuration (experiment, registry names)
 │
-├── tests/                           # API contract + model invariants
+├── tests/                           # API contract, model invariants, promotion rule, DAG
 │
 ├── .github/workflows/ci-cd.yml
 ├── .env.example
 ├── Dockerfile.api
 ├── Dockerfile.dashboard
-├── docker-compose.yml
+├── Dockerfile.mlflow
+├── Dockerfile.airflow
+├── docker-compose.yml               # API + dashboard
+├── docker-compose.mlops.yml         # MLflow + Airflow
 ├── pytest.ini
 ├── requirements.txt
 ├── requirements-dev.txt
+├── requirements-pipeline.txt        # Airflow task dependencies
 └── README.md
 ```
 
@@ -486,8 +574,12 @@ python -m src.data.transformation      # build the feature dataset
 python -m src.models.train             # train the regressor
 python -m src.models.train_classifier  # train the spike classifier
 python -m src.models.baseline          # compare models vs naive baselines
+python -m src.models.promote           # promote to "champion" only if better
 python -m src.models.explainability    # compute SHAP feature importance
 ```
+
+Training runs are logged to MLflow (local `mlflow.db` by default, or the server set
+in `MLFLOW_TRACKING_URI`). `python -m src.data.ingestion` downloads fresh data.
 
 ---
 
@@ -509,9 +601,7 @@ Ranked by expected impact on the weakest part of the system, the 48h point forec
   a target far less dominated by noise
 * Walk-forward (rolling-origin) cross-validation instead of a single split
 * Probabilistic forecasting with prediction intervals
-* MLflow experiment tracking
 * Drift monitoring
-* Airflow orchestration
 * Multi-city forecasting
 
 ---

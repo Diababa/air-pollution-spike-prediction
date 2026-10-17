@@ -21,68 +21,29 @@ Usage : python -m src.models.baseline
 """
 
 import numpy as np
-import pandas as pd
 import joblib
 
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
+from src.models.common import (
+    SPIKE_THRESHOLD_PROBA,
+    TRAIN_RATIO,
+    chronological_split,
+    classification_scores,
+    feature_columns,
+    load_data,
+    regression_scores,
 )
 
-DATA_PATH = "data/processed/train.csv"
 REGRESSOR_PATH = "models/xgboost_pm25_48h.pkl"
 CLASSIFIER_PATH = "models/xgboost_spike_classifier.pkl"
 REPORT_PATH = "reports/baseline_comparison.md"
 
-TRAIN_RATIO = 0.8
-SPIKE_QUANTILE = 0.90         # identique a src/data/transformation.py
-SPIKE_THRESHOLD_PROBA = 0.30  # identique a src/models/train_classifier.py
-
-EXCLUDED_COLUMNS = ["datetime", "target_pm25_48h", "spike_48h"]
+SPIKE_QUANTILE = 0.90  # identique a src/data/transformation.py
 
 
-def load_data(path=DATA_PATH):
-    df = pd.read_csv(path)
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    return df.sort_values("datetime").reset_index(drop=True)
-
-
-def chronological_split(df, ratio=TRAIN_RATIO):
-    """Meme decoupage que train.py / train_classifier.py : aucun shuffle."""
-    split_index = int(len(df) * ratio)
-    return df.iloc[:split_index], df.iloc[split_index:]
-
-
-def regression_scores(y_true, y_pred):
-    return {
-        "MAE": mean_absolute_error(y_true, y_pred),
-        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "R2": r2_score(y_true, y_pred),
-    }
-
-
-def classification_scores(y_true, y_pred):
-    return {
-        "Accuracy": accuracy_score(y_true, y_pred),
-        "Precision": precision_score(y_true, y_pred, zero_division=0),
-        "Recall": recall_score(y_true, y_pred, zero_division=0),
-        "F1": f1_score(y_true, y_pred, zero_division=0),
-    }
-
-
-def evaluate(df):
-    train, test = chronological_split(df)
-
-    feature_cols = [c for c in df.columns if c not in EXCLUDED_COLUMNS]
+def regression_baselines(train, test):
+    """Scores des baselines de regression sur le jeu de test."""
     y_test = test["target_pm25_48h"]
-
-    # ---------- Regression ----------
-    regression = {
+    return {
         "Persistence (PM2.5 in 48h = PM2.5 now)":
             regression_scores(y_test, test["pm25"]),
         "Smoothed persistence (24h rolling mean)":
@@ -94,30 +55,42 @@ def evaluate(df):
             ),
     }
 
-    regressor = joblib.load(REGRESSOR_PATH)
-    regression["XGBoost Regressor"] = regression_scores(
-        y_test, regressor.predict(test[feature_cols])
-    )
 
-    # ---------- Classification ----------
-    # Seuil de pic : quantile 90 du PM2.5, comme dans transformation.py
-    spike_threshold = df["pm25"].quantile(SPIKE_QUANTILE)
+def spike_threshold(df):
+    """Seuil de pic : quantile 90 du PM2.5, comme dans transformation.py."""
+    return df["pm25"].quantile(SPIKE_QUANTILE)
+
+
+def classification_baselines(df, test):
+    """Scores des baselines de classification sur le jeu de test."""
     y_test_spike = test["spike_48h"]
-
-    classification = {
+    return {
         "Spike persistence (spike now -> spike in 48h)":
             classification_scores(
                 y_test_spike,
-                (test["pm25"] > spike_threshold).astype(int),
+                (test["pm25"] > spike_threshold(df)).astype(int),
             ),
         'Always "no spike" (majority class)':
             classification_scores(y_test_spike, np.zeros(len(test), dtype=int)),
     }
 
+
+def evaluate(df):
+    train, test = chronological_split(df)
+    cols = feature_columns(df)
+    y_test = test["target_pm25_48h"]
+
+    regression = regression_baselines(train, test)
+    regressor = joblib.load(REGRESSOR_PATH)
+    regression["XGBoost Regressor"] = regression_scores(
+        y_test, regressor.predict(test[cols])
+    )
+
+    classification = classification_baselines(df, test)
     classifier = joblib.load(CLASSIFIER_PATH)
-    probs = classifier.predict_proba(test[feature_cols])[:, 1]
+    probs = classifier.predict_proba(test[cols])[:, 1]
     classification["XGBoost Classifier (threshold 0.30)"] = classification_scores(
-        y_test_spike, (probs >= SPIKE_THRESHOLD_PROBA).astype(int)
+        test["spike_48h"], (probs >= SPIKE_THRESHOLD_PROBA).astype(int)
     )
 
     context = {
@@ -125,8 +98,8 @@ def evaluate(df):
         "rows_test": len(test),
         "train_period": (train["datetime"].min(), train["datetime"].max()),
         "test_period": (test["datetime"].min(), test["datetime"].max()),
-        "spike_threshold": spike_threshold,
-        "spike_rate_test": y_test_spike.mean(),
+        "spike_threshold": spike_threshold(df),
+        "spike_rate_test": test["spike_48h"].mean(),
     }
 
     return regression, classification, context
@@ -191,14 +164,15 @@ def build_report(regression, classification, context):
     return "\n".join(lines)
 
 
-if __name__ == "__main__":
+def run():
     df = load_data()
     regression, classification, context = evaluate(df)
     report = build_report(regression, classification, context)
-
-    print(report)
-
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         f.write(report)
-
+    print(report)
     print(f"Rapport sauvegarde dans {REPORT_PATH}")
+
+
+if __name__ == "__main__":
+    run()

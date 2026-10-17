@@ -1,0 +1,10 @@
+# Dépendances des tâches du DAG Airflow (image Dockerfile.airflow).
+# Réduites au strict nécessaire : ni Streamlit ni l'API ne tournent dans Airflow.
+# Combinaison vérifiée avec apache-airflow==3.2.2 (pip check sans conflit).
+pandas
+numpy
+requests
+scikit-learn
+xgboost==3.4.1
+joblib
+mlflow==3.16.1

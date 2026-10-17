@@ -59,15 +59,15 @@ def clean_final(df):
     return df
 
 
-if __name__ == "__main__":
+def run(path="data/processed/train.csv"):
     df = load_data()
     df = create_features(df)
     df = create_target(df)
     df = clean_final(df)
+    df.to_csv(path, index=False)
+    print(f"{df.shape[0]} lignes, {df.shape[1]} colonnes sauvegardées dans {path}")
+    return path
 
-    print(df.shape)
-    print(df.head())
-    print(df.isnull().sum())
 
-    df.to_csv("data/processed/train.csv", index=False)
-    print("✅ Dataset transformé et sauvegardé")
+if __name__ == "__main__":
+    run()

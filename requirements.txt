@@ -2,7 +2,7 @@ pandas
 numpy
 requests
 scikit-learn
-xgboost
+xgboost==3.4.1
 joblib
 fastapi
 uvicorn

@@ -1,0 +1,7 @@
+FROM apache/airflow:3.2.2-python3.11
+
+COPY requirements-pipeline.txt /requirements-pipeline.txt
+
+# Réinstaller apache-airflow à la même version empêche pip de le
+# mettre à jour ou de le rétrograder en résolvant nos dépendances.
+RUN pip install --no-cache-dir "apache-airflow==${AIRFLOW_VERSION}" -r /requirements-pipeline.txt
