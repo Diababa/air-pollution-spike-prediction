@@ -1,0 +1,85 @@
+From 87cc399bc5695feda011b3a32706ee2722417b5d Mon Sep 17 00:00:00 2001
+From: Moussa Dia <mdiababa@outlook.com>
+Date: Sat, 17 Oct 2026 21:59:31 +0000
+Subject: [PATCH] Generate the baseline report after promotion, not before
+
+The report loads the exported models, i.e. the ones served by the API.
+Run before promotion, it described the previous champion instead of the
+model actually deployed at the end of the run.
+---
+ README.md                      |  4 ++--
+ dags/air_pollution_pipeline.py | 10 ++++++----
+ tests/test_pipeline.py         |  8 +++++---
+ 3 files changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/README.md b/README.md
+index 788c7c9..3565d41 100644
+--- a/README.md
++++ b/README.md
+@@ -365,7 +365,7 @@ With `MODEL_SOURCE=mlflow`, the API loads the champion straight from the registr
+ [`dags/air_pollution_pipeline.py`](dags/air_pollution_pipeline.py):
+ 
+ ```
+-ingest → transform → validate → [train_regressor, train_classifier] → baseline_report → [promote_regressor, promote_classifier]
++ingest → transform → validate → [train_regressor, train_classifier] → [promote_regressor, promote_classifier] → baseline_report
+ ```
+ 
+ * **Reproducible ingestion:** a 3-year sliding window anchored on the run's logical
+@@ -574,8 +574,8 @@ streamlit run dashboard/app.py
+ python -m src.data.transformation      # build the feature dataset
+ python -m src.models.train             # train the regressor
+ python -m src.models.train_classifier  # train the spike classifier
+-python -m src.models.baseline          # compare models vs naive baselines
+ python -m src.models.promote           # promote to "champion" only if better
++python -m src.models.baseline          # compare served models vs naive baselines
+ python -m src.models.explainability    # compute SHAP feature importance
+ ```
+ 
+diff --git a/dags/air_pollution_pipeline.py b/dags/air_pollution_pipeline.py
+index b1b27df..b2ee757 100644
+--- a/dags/air_pollution_pipeline.py
++++ b/dags/air_pollution_pipeline.py
+@@ -8,9 +8,11 @@
+    ordre chronologique). Le pipeline s'arrête ici si les données sont mauvaises.
+ 4. **train_regressor / train_classifier** (en parallèle) : runs MLflow,
+    nouvelles versions candidates dans le Model Registry.
+-5. **baseline_report** : rapport de comparaison aux baselines naïves.
+-6. **promote_regressor / promote_classifier** : alias « champion » donné
+-   uniquement si la version bat les baselines ET le champion en place.
++5. **promote_regressor / promote_classifier** : alias « champion » donné
++   uniquement si la version bat les baselines ET le champion en place ;
++   le champion est exporté pour l'API.
++6. **baseline_report** : rapport de comparaison aux baselines, généré APRÈS
++   la promotion pour décrire les modèles réellement servis par l'API.
+ 
+ Hebdomadaire plutôt que quotidien : une semaine de données nouvelles sur
+ 3 ans d'historique (environ 0,6 %) ne justifie pas un réentraînement par jour.
+@@ -105,8 +107,8 @@ def air_pollution_retraining():
+         transform(),
+         validate(),
+         [train_regressor(), train_classifier()],
+-        baseline_report(),
+         [promote_regressor(), promote_classifier()],
++        baseline_report(),
+     )
+ 
+ 
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+index 48fc586..6938b34 100644
+--- a/tests/test_pipeline.py
++++ b/tests/test_pipeline.py
+@@ -26,6 +26,8 @@ def test_dag_structure():
+     assert upstream["validate"] == {"transform"}
+     assert upstream["train_regressor"] == {"validate"}
+     assert upstream["train_classifier"] == {"validate"}
+-    # Aucune promotion sans rapport de baselines à jour
+-    assert upstream["promote_regressor"] == {"baseline_report"}
+-    assert upstream["promote_classifier"] == {"baseline_report"}
++    # Chaque promotion attend l'entraînement de SON modèle
++    assert upstream["promote_regressor"] == {"train_regressor"}
++    assert upstream["promote_classifier"] == {"train_classifier"}
++    # Le rapport décrit les modèles servis : il vient APRÈS la promotion
++    assert upstream["baseline_report"] == {"promote_regressor", "promote_classifier"}
+-- 
+2.43.0
+

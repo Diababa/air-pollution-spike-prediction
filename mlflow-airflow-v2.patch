@@ -1,0 +1,1493 @@
+From 30699239112e4ebfacfff533e060e6a54555b819 Mon Sep 17 00:00:00 2001
+From: Moussa Dia <mdiababa@outlook.com>
+Date: Sat, 17 Oct 2026 21:10:31 +0000
+Subject: [PATCH] Add MLflow tracking, Model Registry promotion and weekly
+ Airflow retraining
+
+- MLflow: every run logs params, train/test periods, test metrics and the naive
+  baselines on the same test set; models registered as candidate versions.
+- Promotion (src/models/promote.py): alias 'champion' only if the candidate beats
+  the best baseline AND the current champion re-evaluated on the current test set.
+  Champion exported to models/*.pkl for the API; MODEL_SOURCE=mlflow loads it
+  from the registry instead (with fallback when no champion exists).
+- Airflow DAG: ingest -> transform -> validate -> train (x2) -> baseline report ->
+  promote (x2), weekly. Ingestion uses a reproducible sliding window anchored on
+  the run's logical date instead of hard-coded dates.
+- docker-compose.mlops.yml: MLflow server + Airflow standalone.
+- Shared split/metrics in src/models/common.py; xgboost pinned (3.4.1) so the
+  exported model loads with the same version in the API.
+- Tests: promotion rule, ingestion window, DAG structure (16 passed).
+---
+ .gitignore                     |   5 ++
+ Dockerfile.airflow             |   7 ++
+ Dockerfile.mlflow              |  16 ++++
+ README.md                      | 100 ++++++++++++++++++++++--
+ dags/air_pollution_pipeline.py | 113 +++++++++++++++++++++++++++
+ docker-compose.mlops.yml       |  37 +++++++++
+ requirements-dev.txt           |   1 +
+ requirements-pipeline.txt      |  10 +++
+ requirements.txt               |   2 +-
+ src/api/app.py                 |  29 +++++--
+ src/data/ingestion.py          | 139 ++++++++++++++++++---------------
+ src/data/transformation.py     |  12 +--
+ src/models/baseline.py         | 114 +++++++++++----------------
+ src/models/common.py           |  60 ++++++++++++++
+ src/models/promote.py          | 120 ++++++++++++++++++++++++++++
+ src/models/train.py            | 132 +++++++++++++++++--------------
+ src/models/train_classifier.py | 138 ++++++++++++++++++--------------
+ src/tracking.py                |  22 ++++++
+ tests/test_pipeline.py         |  31 ++++++++
+ tests/test_promotion.py        |  25 ++++++
+ 20 files changed, 848 insertions(+), 265 deletions(-)
+ create mode 100644 Dockerfile.airflow
+ create mode 100644 Dockerfile.mlflow
+ create mode 100644 dags/air_pollution_pipeline.py
+ create mode 100644 docker-compose.mlops.yml
+ create mode 100644 requirements-pipeline.txt
+ create mode 100644 src/models/common.py
+ create mode 100644 src/models/promote.py
+ create mode 100644 src/tracking.py
+ create mode 100644 tests/test_pipeline.py
+ create mode 100644 tests/test_promotion.py
+
+diff --git a/.gitignore b/.gitignore
+index 7b12d09..d5ee2b7 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -33,3 +33,8 @@ logs/
+ .idea/
+ .DS_Store
+ Thumbs.db
++
++# ---------- MLflow (suivi local) ----------
++mlflow.db
++mlruns/
++mlartifacts/
+diff --git a/Dockerfile.airflow b/Dockerfile.airflow
+new file mode 100644
+index 0000000..b7e2264
+--- /dev/null
++++ b/Dockerfile.airflow
+@@ -0,0 +1,7 @@
++FROM apache/airflow:3.2.2-python3.11
++
++COPY requirements-pipeline.txt /requirements-pipeline.txt
++
++# Réinstaller apache-airflow à la même version empêche pip de le
++# mettre à jour ou de le rétrograder en résolvant nos dépendances.
++RUN pip install --no-cache-dir "apache-airflow==${AIRFLOW_VERSION}" -r /requirements-pipeline.txt
+diff --git a/Dockerfile.mlflow b/Dockerfile.mlflow
+new file mode 100644
+index 0000000..b77bf80
+--- /dev/null
++++ b/Dockerfile.mlflow
+@@ -0,0 +1,16 @@
++FROM python:3.11-slim
++
++RUN pip install --no-cache-dir mlflow==3.16.1
++
++EXPOSE 5000
++
++# Base SQLite (exigée par le Model Registry) et artefacts dans un volume.
++# --artifacts-destination : les clients envoient les modèles via le serveur,
++# ils n'ont pas besoin d'accéder directement au disque.
++# --allowed-hosts : MLflow refuse par défaut les en-têtes Host inconnus,
++# il faut autoriser le nom de service utilisé par le conteneur Airflow.
++CMD ["mlflow", "server", \
++     "--host", "0.0.0.0", "--port", "5000", \
++     "--backend-store-uri", "sqlite:////mlflow/mlflow.db", \
++     "--artifacts-destination", "/mlflow/artifacts", \
++     "--allowed-hosts", "mlflow:5000,localhost:5000,127.0.0.1:5000"]
+diff --git a/README.md b/README.md
+index 0152de5..5b9389c 100644
+--- a/README.md
++++ b/README.md
+@@ -317,11 +317,89 @@ during development:
+ * the features expected by each saved model must match the API schema exactly;
+ * no model may consume a column derived from the target.
+ 
++It also checks the promotion rule (including the real case of the current regressor,
++which must not be promoted), the reproducibility of the ingestion window and, when
++Airflow is installed, the structure of the DAG.
++
+ [GitHub Actions](.github/workflows/ci-cd.yml) runs the tests, regenerates the
+ baseline comparison and builds both Docker images on every push to `main`.
+ 
+ ---
+ 
++# 🔁 MLOps: MLflow Tracking & Airflow Orchestration
++
++## Experiment tracking & Model Registry (MLflow)
++
++Every training run is logged to MLflow:
++
++* hyperparameters, training / test periods and dataset sizes;
++* test metrics (MAE / RMSE / R² for the regressor, precision / recall / F1 and the
++  confusion matrix for the classifier);
++* **the naive baselines computed on the same test set, in the same run**, plus a
++  `beats_best_baseline_*` tag, so no metric is ever read without its reference;
++* the model itself, with its input signature, registered as a new **candidate
++  version** in the Model Registry (`pm25-48h-regressor`, `pm25-spike-classifier`).
++
++## Promotion rule
++
++[`src/models/promote.py`](src/models/promote.py) gives the `champion` alias to the
++latest version **only if, on the current test set**, it beats:
++
++1. the best naive baseline, and
++2. the current champion, re-evaluated on that same test set (a metric logged on an
++   older test window would not be comparable, since the window moves with each
++   retraining).
++
++The decision and the scores behind it are stored as tags on the model version. A
++promoted model is also exported to `models/*.pkl`, which the API serves on Render.
++With `MODEL_SOURCE=mlflow`, the API loads the champion straight from the registry.
++
++> **Current status, stated honestly:** the spike classifier is promoted. The
++> regressor is **not**: its MAE does not beat the climatology baseline (see
++> [Results vs baselines](#results-vs-baselines)), so the rule keeps it out of
++> production. The regression endpoint still serves the last exported model.
++
++## Weekly retraining (Airflow)
++
++[`dags/air_pollution_pipeline.py`](dags/air_pollution_pipeline.py):
++
++```
++ingest → transform → validate → [train_regressor, train_classifier] → baseline_report → [promote_regressor, promote_classifier]
++```
++
++* **Reproducible ingestion:** a 3-year sliding window anchored on the run's logical
++  date (minus 7 days, the delay before Open-Meteo's weather archive is consolidated),
++  so any past run can be replayed on exactly the same data.
++* **Quality gate:** `validate` has no retries; bad data stops the pipeline before
++  any model is trained.
++* **Weekly, not daily:** one new week on three years of history (~0.6 % of the data)
++  does not justify daily retraining.
++
++## Run the MLOps stack locally
++
++```bash
++docker compose -f docker-compose.mlops.yml up --build
++```
++
++| Service | URL |
++| ------- | --- |
++| MLflow UI | http://localhost:5000 |
++| Airflow UI | http://localhost:8080 |
++
++Airflow runs in `standalone` mode: the generated admin password is printed in the logs
++(`docker compose -f docker-compose.mlops.yml logs airflow | grep -i password`).
++On Linux, run `echo "AIRFLOW_UID=$(id -u)" >> .env` first so that files written to the
++mounted project belong to your user. Airflow is not deployed on Render: the free
++tier cannot host a scheduler.
++
++Without Docker, MLflow falls back to a local SQLite store (`mlflow.db`):
++
++```bash
++mlflow ui --backend-store-uri sqlite:///mlflow.db
++```
++
++---
++
+ # 🐳 Docker Deployment
+ 
+ The application is fully containerized using:
+@@ -377,6 +455,8 @@ Free tier, so expect the cold start described in the [Live Demo](#-live-demo) se
+ * Docker Compose
+ * Render
+ * GitHub Actions
++* MLflow (tracking & Model Registry)
++* Apache Airflow
+ 
+ ---
+ 
+@@ -385,6 +465,9 @@ Free tier, so expect the cold start described in the [Live Demo](#-live-demo) se
+ ```text
+ ml-project/
+ │
++├── dags/
++│   └── air_pollution_pipeline.py    # Airflow DAG: weekly retraining
++│
+ ├── dashboard/
+ │   └── app.py                       # Streamlit UI
+ │
+@@ -402,18 +485,23 @@ ml-project/
+ ├── src/
+ │   ├── api/app.py                   # FastAPI service
+ │   ├── data/                        # Ingestion, validation, transformation
+-│   └── models/                      # train, train_classifier, baseline, explainability
++│   ├── models/                      # train, train_classifier, baseline, promote, explainability
++│   └── tracking.py                  # MLflow configuration (experiment, registry names)
+ │
+-├── tests/                           # API contract + model invariants
++├── tests/                           # API contract, model invariants, promotion rule, DAG
+ │
+ ├── .github/workflows/ci-cd.yml
+ ├── .env.example
+ ├── Dockerfile.api
+ ├── Dockerfile.dashboard
+-├── docker-compose.yml
++├── Dockerfile.mlflow
++├── Dockerfile.airflow
++├── docker-compose.yml               # API + dashboard
++├── docker-compose.mlops.yml         # MLflow + Airflow
+ ├── pytest.ini
+ ├── requirements.txt
+ ├── requirements-dev.txt
++├── requirements-pipeline.txt        # Airflow task dependencies
+ └── README.md
+ ```
+ 
+@@ -486,9 +574,13 @@ python -m src.data.transformation      # build the feature dataset
+ python -m src.models.train             # train the regressor
+ python -m src.models.train_classifier  # train the spike classifier
+ python -m src.models.baseline          # compare models vs naive baselines
++python -m src.models.promote           # promote to "champion" only if better
+ python -m src.models.explainability    # compute SHAP feature importance
+ ```
+ 
++Training runs are logged to MLflow (local `mlflow.db` by default, or the server set
++in `MLFLOW_TRACKING_URI`). `python -m src.data.ingestion` downloads fresh data.
++
+ ---
+ 
+ # 🐳 Run with Docker
+@@ -509,9 +601,7 @@ Ranked by expected impact on the weakest part of the system, the 48h point forec
+   a target far less dominated by noise
+ * Walk-forward (rolling-origin) cross-validation instead of a single split
+ * Probabilistic forecasting with prediction intervals
+-* MLflow experiment tracking
+ * Drift monitoring
+-* Airflow orchestration
+ * Multi-city forecasting
+ 
+ ---
+diff --git a/dags/air_pollution_pipeline.py b/dags/air_pollution_pipeline.py
+new file mode 100644
+index 0000000..b1b27df
+--- /dev/null
++++ b/dags/air_pollution_pipeline.py
+@@ -0,0 +1,113 @@
++"""
++### Réentraînement hebdomadaire — prédiction de pics de pollution PM2.5 à 48 h
++
++1. **ingest** : télécharge 3 ans de PM2.5 et de météo (fenêtre glissante
++   calée sur la date logique du run, donc rejouable à l'identique).
++2. **transform** : features de séries temporelles et cibles à 48 h.
++3. **validate** : contrôles qualité (colonnes, valeurs manquantes, doublons,
++   ordre chronologique). Le pipeline s'arrête ici si les données sont mauvaises.
++4. **train_regressor / train_classifier** (en parallèle) : runs MLflow,
++   nouvelles versions candidates dans le Model Registry.
++5. **baseline_report** : rapport de comparaison aux baselines naïves.
++6. **promote_regressor / promote_classifier** : alias « champion » donné
++   uniquement si la version bat les baselines ET le champion en place.
++
++Hebdomadaire plutôt que quotidien : une semaine de données nouvelles sur
++3 ans d'historique (environ 0,6 %) ne justifie pas un réentraînement par jour.
++"""
++
++import os
++from datetime import datetime, timedelta
++
++from airflow.sdk import chain, dag, task
++
++PROJECT_DIR = os.getenv("AIR_POLLUTION_PROJECT_DIR", "/opt/airflow/project")
++
++
++def _in_project():
++    """Les modules du projet utilisent des chemins relatifs à sa racine."""
++    os.chdir(PROJECT_DIR)
++
++
++@dag(
++    dag_id="air_pollution_retraining",
++    schedule="@weekly",
++    start_date=datetime(2026, 10, 1),
++    catchup=False,
++    max_active_runs=1,
++    default_args={"retries": 2, "retry_delay": timedelta(minutes=5)},
++    tags=["ml", "mlflow", "air-pollution"],
++    doc_md=__doc__,
++)
++def air_pollution_retraining():
++
++    @task(retries=3, retry_delay=timedelta(minutes=10))
++    def ingest(logical_date=None):
++        _in_project()
++        from src.data.ingestion import run
++
++        reference = (logical_date or datetime.now()).date()
++        return run(reference=reference)
++
++    @task
++    def transform():
++        _in_project()
++        from src.data.transformation import run
++
++        return run()
++
++    @task(retries=0)
++    def validate():
++        _in_project()
++        from src.data.validation import validate_dataset
++
++        validate_dataset()
++
++    @task
++    def train_regressor():
++        _in_project()
++        from src.models.train import run
++
++        run()
++
++    @task
++    def train_classifier():
++        _in_project()
++        from src.models.train_classifier import run
++
++        run()
++
++    @task
++    def baseline_report():
++        _in_project()
++        from src.models.baseline import run
++
++        run()
++
++    @task
++    def promote_regressor():
++        _in_project()
++        from src.models.promote import run
++        from src.tracking import REGRESSOR_NAME
++
++        return run(names=(REGRESSOR_NAME,))
++
++    @task
++    def promote_classifier():
++        _in_project()
++        from src.models.promote import run
++        from src.tracking import CLASSIFIER_NAME
++
++        return run(names=(CLASSIFIER_NAME,))
++
++    chain(
++        ingest(),
++        transform(),
++        validate(),
++        [train_regressor(), train_classifier()],
++        baseline_report(),
++        [promote_regressor(), promote_classifier()],
++    )
++
++
++air_pollution_retraining()
+diff --git a/docker-compose.mlops.yml b/docker-compose.mlops.yml
+new file mode 100644
+index 0000000..b037060
+--- /dev/null
++++ b/docker-compose.mlops.yml
+@@ -0,0 +1,37 @@
++# Stack MLOps locale : serveur MLflow + Airflow (mode standalone).
++#   docker compose -f docker-compose.mlops.yml up --build
++#   MLflow  : http://localhost:5000
++#   Airflow : http://localhost:8080  (mot de passe admin dans les logs)
++services:
++  mlflow:
++    build:
++      context: .
++      dockerfile: Dockerfile.mlflow
++    container_name: air_pollution_mlflow
++    ports:
++      - "5000:5000"
++    volumes:
++      - mlflow-data:/mlflow
++
++  airflow:
++    build:
++      context: .
++      dockerfile: Dockerfile.airflow
++    container_name: air_pollution_airflow
++    command: standalone
++    user: "${AIRFLOW_UID:-50000}:0"
++    ports:
++      - "8080:8080"
++    environment:
++      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
++      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/project/dags
++      AIR_POLLUTION_PROJECT_DIR: /opt/airflow/project
++      PYTHONPATH: /opt/airflow/project
++      MLFLOW_TRACKING_URI: http://mlflow:5000
++    volumes:
++      - ./:/opt/airflow/project
++    depends_on:
++      - mlflow
++
++volumes:
++  mlflow-data:
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+index 93adbac..7bb3e2b 100644
+--- a/requirements-dev.txt
++++ b/requirements-dev.txt
+@@ -1,4 +1,5 @@
+ # Dépendances de développement / CI uniquement
+ -r requirements.txt
++mlflow==3.16.1
+ pytest>=7.0
+ httpx
+diff --git a/requirements-pipeline.txt b/requirements-pipeline.txt
+new file mode 100644
+index 0000000..49df620
+--- /dev/null
++++ b/requirements-pipeline.txt
+@@ -0,0 +1,10 @@
++# Dépendances des tâches du DAG Airflow (image Dockerfile.airflow).
++# Réduites au strict nécessaire : ni Streamlit ni l'API ne tournent dans Airflow.
++# Combinaison vérifiée avec apache-airflow==3.2.2 (pip check sans conflit).
++pandas
++numpy
++requests
++scikit-learn
++xgboost==3.4.1
++joblib
++mlflow==3.16.1
+diff --git a/requirements.txt b/requirements.txt
+index b77d56d..fd57ce4 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,7 +2,7 @@ pandas
+ numpy
+ requests
+ scikit-learn
+-xgboost
++xgboost==3.4.1
+ joblib
+ fastapi
+ uvicorn
+diff --git a/src/api/app.py b/src/api/app.py
+index c6499f5..587d9ce 100644
+--- a/src/api/app.py
++++ b/src/api/app.py
+@@ -1,3 +1,5 @@
++import os
++
+ from fastapi import FastAPI
+ from pydantic import BaseModel
+ 
+@@ -8,14 +10,25 @@ import pandas as pd
+ # ---------------------------------------------------
+ # Charger modèles
+ # ---------------------------------------------------
+-
+-regression_model = joblib.load(
+-    "models/xgboost_pm25_48h.pkl"
+-)
+-
+-classifier_model = joblib.load(
+-    "models/xgboost_spike_classifier.pkl"
+-)
++# Par défaut : fichiers .pkl exportés par src/models/promote.py (déploiement
++# Render, sans serveur MLflow). Avec MODEL_SOURCE=mlflow : chargement direct
++# de la version « champion » depuis le Model Registry.
++
++def load_model(registered_name, fallback_path):
++    if os.getenv("MODEL_SOURCE") == "mlflow":
++        import mlflow.xgboost
++        from mlflow.exceptions import MlflowException
++        try:
++            return mlflow.xgboost.load_model(f"models:/{registered_name}@champion")
++        except MlflowException as exc:
++            # Aucun champion (ex. le modèle n'a jamais battu les baselines) :
++            # on garde le dernier modèle exporté plutôt que de bloquer l'API.
++            print(f"[{registered_name}] pas de champion MLflow ({exc}), repli sur {fallback_path}")
++    return joblib.load(fallback_path)
++
++
++regression_model = load_model("pm25-48h-regressor", "models/xgboost_pm25_48h.pkl")
++classifier_model = load_model("pm25-spike-classifier", "models/xgboost_spike_classifier.pkl")
+ 
+ 
+ # ---------------------------------------------------
+diff --git a/src/data/ingestion.py b/src/data/ingestion.py
+index 557a081..40f5eee 100644
+--- a/src/data/ingestion.py
++++ b/src/data/ingestion.py
+@@ -1,83 +1,100 @@
+-import requests
+-import pandas as pd
+-
+-#### Récupétation des donnée de pollution et météo pour Paris (48.85, 2.35) sur les 3 dernières années (1095 jours) ####    
+-def fetch_pollution():
+-    url = "https://air-quality-api.open-meteo.com/v1/air-quality"
++"""Ingestion des données de pollution (PM2.5) et météo pour Paris (48.85, 2.35).
+ 
+-    params = {
+-        "latitude": 48.85,
+-        "longitude": 2.35,
+-        "hourly": "pm2_5",
+-        "past_days": 1095
+-    }
++La fenêtre est glissante : HISTORY_DAYS jours se terminant ARCHIVE_DELAY_DAYS
++jours avant la date de référence. Le délai laisse le temps à l'archive météo
++Open-Meteo d'être consolidée. Une date de référence explicite (fournie par
++Airflow) rend chaque exécution reproductible.
+ 
+-    response = requests.get(url, params=params)
+-    data = response.json()
++Usage : python -m src.data.ingestion
++"""
+ 
+-    df = pd.DataFrame({
+-        "datetime": data["hourly"]["time"],
+-        "pm25": data["hourly"]["pm2_5"]
+-    })
++from datetime import date, timedelta
+ 
+-    return df
++import pandas as pd
++import requests
+ 
+-### Récupération des données météo pour Paris (48.85, 2.35) sur les 3 dernières années (1095 jours) ####
+-def fetch_weather():
+-    url = "https://archive-api.open-meteo.com/v1/archive"
++LATITUDE, LONGITUDE = 48.85, 2.35
++HISTORY_DAYS = 1095
++ARCHIVE_DELAY_DAYS = 7
++RAW_PATH = "data/raw/pollution_weather.csv"
++TIMEOUT = 60
+ 
+-    params = {
+-        "latitude": 48.85,
+-        "longitude": 2.35,
+-        "start_date": "2023-04-27",
+-        "end_date": "2026-04-26",
+-        "hourly": [
+-            "temperature_2m",
+-            "relative_humidity_2m",
+-            "wind_speed_10m",
+-            "wind_direction_10m"
+-        ]
+-    }
+ 
+-    response = requests.get(url, params=params)
++def date_window(reference=None):
++    reference = reference or date.today()
++    end = reference - timedelta(days=ARCHIVE_DELAY_DAYS)
++    start = end - timedelta(days=HISTORY_DAYS - 1)
++    return start, end
+ 
+-    print("Weather status:", response.status_code)
+ 
++def _get_hourly(url, params):
++    response = requests.get(url, params=params, timeout=TIMEOUT)
++    response.raise_for_status()
+     data = response.json()
+-
+     if "hourly" not in data:
+-        print("❌ Erreur météo:", data)
+-        return None
+-
+-    df = pd.DataFrame({
+-        "datetime": data["hourly"]["time"],
+-        "temperature": data["hourly"]["temperature_2m"],
+-        "humidity": data["hourly"]["relative_humidity_2m"],
+-        "wind_speed": data["hourly"]["wind_speed_10m"],
+-        "wind_direction": data["hourly"]["wind_direction_10m"]
++        raise RuntimeError(f"Réponse inattendue de {url} : {data}")
++    return data["hourly"]
++
++
++def fetch_pollution(start, end):
++    hourly = _get_hourly(
++        "https://air-quality-api.open-meteo.com/v1/air-quality",
++        {
++            "latitude": LATITUDE,
++            "longitude": LONGITUDE,
++            "hourly": "pm2_5",
++            "start_date": start.isoformat(),
++            "end_date": end.isoformat(),
++        },
++    )
++    return pd.DataFrame({"datetime": hourly["time"], "pm25": hourly["pm2_5"]})
++
++
++def fetch_weather(start, end):
++    hourly = _get_hourly(
++        "https://archive-api.open-meteo.com/v1/archive",
++        {
++            "latitude": LATITUDE,
++            "longitude": LONGITUDE,
++            "start_date": start.isoformat(),
++            "end_date": end.isoformat(),
++            "hourly": [
++                "temperature_2m",
++                "relative_humidity_2m",
++                "wind_speed_10m",
++                "wind_direction_10m",
++            ],
++        },
++    )
++    return pd.DataFrame({
++        "datetime": hourly["time"],
++        "temperature": hourly["temperature_2m"],
++        "humidity": hourly["relative_humidity_2m"],
++        "wind_speed": hourly["wind_speed_10m"],
++        "wind_direction": hourly["wind_direction_10m"],
+     })
+ 
+-    return df
+ 
+-### Merge des données de pollution et météo sur la base de la colonne datetime, en utilisant une jointure interne (inner join) pour ne conserver que les lignes où les deux datasets ont des données correspondantes. ####
+-def merge_data():
+-    df_pollution = fetch_pollution()
+-    df_weather = fetch_weather()
++def merge_data(reference=None):
++    start, end = date_window(reference)
++    print(f"Fenêtre d'ingestion : {start} -> {end}")
++
++    df_pollution = fetch_pollution(start, end)
++    df_weather = fetch_weather(start, end)
+ 
+-    # Conversion datetime
+     df_pollution["datetime"] = pd.to_datetime(df_pollution["datetime"])
+     df_weather["datetime"] = pd.to_datetime(df_weather["datetime"])
+ 
+-    # Merge propre
+-    df = pd.merge(df_pollution, df_weather, on="datetime", how="inner")
++    # Jointure interne : seules les heures présentes dans les deux sources
++    return pd.merge(df_pollution, df_weather, on="datetime", how="inner")
+ 
+-    return df
+ 
++def run(reference=None, path=RAW_PATH):
++    df = merge_data(reference)
++    df.to_csv(path, index=False)
++    print(f"{len(df)} lignes sauvegardées dans {path}")
++    return path
+ 
+-if __name__ == "__main__":
+-    df = merge_data()
+-
+-    print(df.head())
+-    print(df.info())
+ 
+-    df.to_csv("data/raw/pollution_weather.csv", index=False)
+\ No newline at end of file
++if __name__ == "__main__":
++    run()
+diff --git a/src/data/transformation.py b/src/data/transformation.py
+index 326063f..3ca56dd 100644
+--- a/src/data/transformation.py
++++ b/src/data/transformation.py
+@@ -59,15 +59,15 @@ def clean_final(df):
+     return df
+ 
+ 
+-if __name__ == "__main__":
++def run(path="data/processed/train.csv"):
+     df = load_data()
+     df = create_features(df)
+     df = create_target(df)
+     df = clean_final(df)
++    df.to_csv(path, index=False)
++    print(f"{df.shape[0]} lignes, {df.shape[1]} colonnes sauvegardées dans {path}")
++    return path
+ 
+-    print(df.shape)
+-    print(df.head())
+-    print(df.isnull().sum())
+ 
+-    df.to_csv("data/processed/train.csv", index=False)
+-    print("✅ Dataset transformé et sauvegardé")
+\ No newline at end of file
++if __name__ == "__main__":
++    run()
+diff --git a/src/models/baseline.py b/src/models/baseline.py
+index cdd3802..9117858 100644
+--- a/src/models/baseline.py
++++ b/src/models/baseline.py
+@@ -21,68 +21,29 @@ Usage : python -m src.models.baseline
+ """
+ 
+ import numpy as np
+-import pandas as pd
+ import joblib
+ 
+-from sklearn.metrics import (
+-    mean_absolute_error,
+-    mean_squared_error,
+-    r2_score,
+-    accuracy_score,
+-    precision_score,
+-    recall_score,
+-    f1_score,
++from src.models.common import (
++    SPIKE_THRESHOLD_PROBA,
++    TRAIN_RATIO,
++    chronological_split,
++    classification_scores,
++    feature_columns,
++    load_data,
++    regression_scores,
+ )
+ 
+-DATA_PATH = "data/processed/train.csv"
+ REGRESSOR_PATH = "models/xgboost_pm25_48h.pkl"
+ CLASSIFIER_PATH = "models/xgboost_spike_classifier.pkl"
+ REPORT_PATH = "reports/baseline_comparison.md"
+ 
+-TRAIN_RATIO = 0.8
+-SPIKE_QUANTILE = 0.90         # identique a src/data/transformation.py
+-SPIKE_THRESHOLD_PROBA = 0.30  # identique a src/models/train_classifier.py
++SPIKE_QUANTILE = 0.90  # identique a src/data/transformation.py
+ 
+-EXCLUDED_COLUMNS = ["datetime", "target_pm25_48h", "spike_48h"]
+ 
+-
+-def load_data(path=DATA_PATH):
+-    df = pd.read_csv(path)
+-    df["datetime"] = pd.to_datetime(df["datetime"])
+-    return df.sort_values("datetime").reset_index(drop=True)
+-
+-
+-def chronological_split(df, ratio=TRAIN_RATIO):
+-    """Meme decoupage que train.py / train_classifier.py : aucun shuffle."""
+-    split_index = int(len(df) * ratio)
+-    return df.iloc[:split_index], df.iloc[split_index:]
+-
+-
+-def regression_scores(y_true, y_pred):
+-    return {
+-        "MAE": mean_absolute_error(y_true, y_pred),
+-        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+-        "R2": r2_score(y_true, y_pred),
+-    }
+-
+-
+-def classification_scores(y_true, y_pred):
+-    return {
+-        "Accuracy": accuracy_score(y_true, y_pred),
+-        "Precision": precision_score(y_true, y_pred, zero_division=0),
+-        "Recall": recall_score(y_true, y_pred, zero_division=0),
+-        "F1": f1_score(y_true, y_pred, zero_division=0),
+-    }
+-
+-
+-def evaluate(df):
+-    train, test = chronological_split(df)
+-
+-    feature_cols = [c for c in df.columns if c not in EXCLUDED_COLUMNS]
++def regression_baselines(train, test):
++    """Scores des baselines de regression sur le jeu de test."""
+     y_test = test["target_pm25_48h"]
+-
+-    # ---------- Regression ----------
+-    regression = {
++    return {
+         "Persistence (PM2.5 in 48h = PM2.5 now)":
+             regression_scores(y_test, test["pm25"]),
+         "Smoothed persistence (24h rolling mean)":
+@@ -94,30 +55,42 @@ def evaluate(df):
+             ),
+     }
+ 
+-    regressor = joblib.load(REGRESSOR_PATH)
+-    regression["XGBoost Regressor"] = regression_scores(
+-        y_test, regressor.predict(test[feature_cols])
+-    )
+ 
+-    # ---------- Classification ----------
+-    # Seuil de pic : quantile 90 du PM2.5, comme dans transformation.py
+-    spike_threshold = df["pm25"].quantile(SPIKE_QUANTILE)
+-    y_test_spike = test["spike_48h"]
++def spike_threshold(df):
++    """Seuil de pic : quantile 90 du PM2.5, comme dans transformation.py."""
++    return df["pm25"].quantile(SPIKE_QUANTILE)
+ 
+-    classification = {
++
++def classification_baselines(df, test):
++    """Scores des baselines de classification sur le jeu de test."""
++    y_test_spike = test["spike_48h"]
++    return {
+         "Spike persistence (spike now -> spike in 48h)":
+             classification_scores(
+                 y_test_spike,
+-                (test["pm25"] > spike_threshold).astype(int),
++                (test["pm25"] > spike_threshold(df)).astype(int),
+             ),
+         'Always "no spike" (majority class)':
+             classification_scores(y_test_spike, np.zeros(len(test), dtype=int)),
+     }
+ 
++
++def evaluate(df):
++    train, test = chronological_split(df)
++    cols = feature_columns(df)
++    y_test = test["target_pm25_48h"]
++
++    regression = regression_baselines(train, test)
++    regressor = joblib.load(REGRESSOR_PATH)
++    regression["XGBoost Regressor"] = regression_scores(
++        y_test, regressor.predict(test[cols])
++    )
++
++    classification = classification_baselines(df, test)
+     classifier = joblib.load(CLASSIFIER_PATH)
+-    probs = classifier.predict_proba(test[feature_cols])[:, 1]
++    probs = classifier.predict_proba(test[cols])[:, 1]
+     classification["XGBoost Classifier (threshold 0.30)"] = classification_scores(
+-        y_test_spike, (probs >= SPIKE_THRESHOLD_PROBA).astype(int)
++        test["spike_48h"], (probs >= SPIKE_THRESHOLD_PROBA).astype(int)
+     )
+ 
+     context = {
+@@ -125,8 +98,8 @@ def evaluate(df):
+         "rows_test": len(test),
+         "train_period": (train["datetime"].min(), train["datetime"].max()),
+         "test_period": (test["datetime"].min(), test["datetime"].max()),
+-        "spike_threshold": spike_threshold,
+-        "spike_rate_test": y_test_spike.mean(),
++        "spike_threshold": spike_threshold(df),
++        "spike_rate_test": test["spike_48h"].mean(),
+     }
+ 
+     return regression, classification, context
+@@ -191,14 +164,15 @@ def build_report(regression, classification, context):
+     return "\n".join(lines)
+ 
+ 
+-if __name__ == "__main__":
++def run():
+     df = load_data()
+     regression, classification, context = evaluate(df)
+     report = build_report(regression, classification, context)
+-
+-    print(report)
+-
+     with open(REPORT_PATH, "w", encoding="utf-8") as f:
+         f.write(report)
+-
++    print(report)
+     print(f"Rapport sauvegarde dans {REPORT_PATH}")
++
++
++if __name__ == "__main__":
++    run()
+diff --git a/src/models/common.py b/src/models/common.py
+new file mode 100644
+index 0000000..17de4ed
+--- /dev/null
++++ b/src/models/common.py
+@@ -0,0 +1,60 @@
++"""Éléments partagés par l'entraînement, les baselines et la promotion.
++
++Un seul endroit pour le découpage chronologique, les colonnes exclues
++et les métriques : les trois étapes évaluent donc exactement la même chose.
++"""
++
++import numpy as np
++import pandas as pd
++from sklearn.metrics import (
++    accuracy_score,
++    f1_score,
++    mean_absolute_error,
++    mean_squared_error,
++    precision_score,
++    r2_score,
++    recall_score,
++)
++
++DATA_PATH = "data/processed/train.csv"
++TRAIN_RATIO = 0.8
++SPIKE_THRESHOLD_PROBA = 0.30
++
++# Colonnes à ne jamais donner au modèle :
++# - datetime        : identifiant temporel
++# - target_pm25_48h : la cible
++# - spike_48h       : dérivée directement de la cible (fuite de cible)
++EXCLUDED_COLUMNS = ["datetime", "target_pm25_48h", "spike_48h"]
++
++
++def load_data(path=DATA_PATH):
++    df = pd.read_csv(path)
++    df["datetime"] = pd.to_datetime(df["datetime"])
++    return df.sort_values("datetime").reset_index(drop=True)
++
++
++def chronological_split(df, ratio=TRAIN_RATIO):
++    """Test strictement postérieur à l'entraînement : aucun shuffle."""
++    split_index = int(len(df) * ratio)
++    return df.iloc[:split_index], df.iloc[split_index:]
++
++
++def feature_columns(df):
++    return [c for c in df.columns if c not in EXCLUDED_COLUMNS]
++
++
++def regression_scores(y_true, y_pred):
++    return {
++        "MAE": float(mean_absolute_error(y_true, y_pred)),
++        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
++        "R2": float(r2_score(y_true, y_pred)),
++    }
++
++
++def classification_scores(y_true, y_pred):
++    return {
++        "Accuracy": float(accuracy_score(y_true, y_pred)),
++        "Precision": float(precision_score(y_true, y_pred, zero_division=0)),
++        "Recall": float(recall_score(y_true, y_pred, zero_division=0)),
++        "F1": float(f1_score(y_true, y_pred, zero_division=0)),
++    }
+diff --git a/src/models/promote.py b/src/models/promote.py
+new file mode 100644
+index 0000000..e9070a2
+--- /dev/null
++++ b/src/models/promote.py
+@@ -0,0 +1,120 @@
++"""Promotion des modèles : décide quelle version passe en production.
++
++Règle (identique pour les deux modèles) : la dernière version enregistrée
++devient « champion » seulement si, sur le jeu de test ACTUEL,
++  1. elle bat la meilleure baseline naïve, et
++  2. elle bat le champion en place (réévalué sur ce même jeu de test :
++     comparer à une métrique enregistrée sur une ancienne fenêtre de test
++     serait biaisé, puisque la fenêtre se déplace à chaque réentraînement).
++
++Si elle est promue, elle est aussi exportée en .pkl pour l'API.
++Sinon, rien ne change en production et la décision est tracée sur la
++version dans le Model Registry (tags promotion_*).
++
++Usage : python -m src.models.promote
++"""
++
++import joblib
++import mlflow.xgboost
++
++from src.models.baseline import classification_baselines, regression_baselines
++from src.models.common import (
++    SPIKE_THRESHOLD_PROBA,
++    chronological_split,
++    classification_scores,
++    feature_columns,
++    load_data,
++    regression_scores,
++)
++from src.tracking import CHAMPION_ALIAS, CLASSIFIER_NAME, REGRESSOR_NAME, setup_mlflow
++
++EXPORT_PATHS = {
++    REGRESSOR_NAME: "models/xgboost_pm25_48h.pkl",
++    CLASSIFIER_NAME: "models/xgboost_spike_classifier.pkl",
++}
++
++
++def should_promote(candidate, baseline, champion=None, higher_is_better=True):
++    """Décision pure, testable sans MLflow."""
++    def better(a, b):
++        return a > b if higher_is_better else a < b
++
++    if not better(candidate, baseline):
++        return False, "ne bat pas la meilleure baseline"
++    if champion is not None and not better(candidate, champion):
++        return False, "ne bat pas le champion en place"
++    return True, "promu"
++
++
++def _score(name, model, df, train, test):
++    """Renvoie (score du modèle, meilleure baseline, plus haut = mieux ?)."""
++    X_test = test[feature_columns(df)]
++    if name == REGRESSOR_NAME:
++        mae = regression_scores(test["target_pm25_48h"], model.predict(X_test))["MAE"]
++        best = min(b["MAE"] for b in regression_baselines(train, test).values())
++        return mae, best, False
++    preds = (model.predict_proba(X_test)[:, 1] >= SPIKE_THRESHOLD_PROBA).astype(int)
++    f1 = classification_scores(test["spike_48h"], preds)["F1"]
++    best = max(b["F1"] for b in classification_baselines(df, test).values())
++    return f1, best, True
++
++
++def promote(name, client, df):
++    train, test = chronological_split(df)
++
++    latest = client.search_model_versions(
++        f"name = '{name}'", order_by=["version_number DESC"], max_results=1
++    )
++    if not latest:
++        print(f"[{name}] aucune version enregistrée, rien à promouvoir")
++        return False
++    candidate = latest[0]
++    cand_model = mlflow.xgboost.load_model(f"models:/{name}/{candidate.version}")
++    cand_score, baseline, higher = _score(name, cand_model, df, train, test)
++
++    champion_score = None
++    try:
++        champion = client.get_model_version_by_alias(name, CHAMPION_ALIAS)
++    except mlflow.exceptions.MlflowException:
++        champion = None
++    if champion is not None:
++        if champion.version == candidate.version:
++            print(f"[{name}] v{candidate.version} est déjà champion")
++            return False
++        champ_model = mlflow.xgboost.load_model(f"models:/{name}@{CHAMPION_ALIAS}")
++        champion_score, _, _ = _score(name, champ_model, df, train, test)
++
++    promoted, reason = should_promote(cand_score, baseline, champion_score, higher)
++
++    metric = "F1" if higher else "MAE"
++    tags = {
++        "promotion_decision": reason,
++        f"promotion_candidate_{metric.lower()}": f"{cand_score:.4f}",
++        f"promotion_baseline_{metric.lower()}": f"{baseline:.4f}",
++    }
++    if champion_score is not None:
++        tags[f"promotion_champion_{metric.lower()}"] = f"{champion_score:.4f}"
++    for key, value in tags.items():
++        client.set_model_version_tag(name, candidate.version, key, value)
++
++    champ_txt = "aucun" if champion_score is None else f"{champion_score:.3f}"
++    print(
++        f"[{name}] v{candidate.version} : {metric} {cand_score:.3f} | "
++        f"baseline {baseline:.3f} | champion {champ_txt} -> {reason}"
++    )
++
++    if promoted:
++        client.set_registered_model_alias(name, CHAMPION_ALIAS, candidate.version)
++        joblib.dump(cand_model, EXPORT_PATHS[name])
++        print(f"[{name}] exporté vers {EXPORT_PATHS[name]}")
++    return promoted
++
++
++def run(names=(REGRESSOR_NAME, CLASSIFIER_NAME)):
++    client = setup_mlflow()
++    df = load_data()
++    return {name: promote(name, client, df) for name in names}
++
++
++if __name__ == "__main__":
++    run()
+diff --git a/src/models/train.py b/src/models/train.py
+index f5d11c4..c9362b5 100644
+--- a/src/models/train.py
++++ b/src/models/train.py
+@@ -1,78 +1,96 @@
+-import pandas as pd
+-import numpy as np
+-import joblib
+-
++"""Entraînement du régresseur PM2.5 à 48 h, tracé dans MLflow.
++
++Chaque exécution :
++- enregistre paramètres, période d'entraînement / de test et métriques ;
++- calcule les baselines naïves sur le MÊME jeu de test et les journalise
++  dans le même run, pour qu'aucune métrique ne soit lue sans référence ;
++- enregistre le modèle dans le Model Registry comme nouvelle version
++  candidate. La mise en production (alias « champion ») est décidée
++  séparément par src/models/promote.py.
++
++Usage : python -m src.models.train
++"""
++
++import mlflow
++import mlflow.xgboost
++from mlflow.models import infer_signature
+ from xgboost import XGBRegressor
+-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+ 
++from src.models.baseline import regression_baselines
++from src.models.common import (
++    chronological_split,
++    feature_columns,
++    load_data,
++    regression_scores,
++)
++from src.tracking import REGRESSOR_NAME, setup_mlflow
+ 
+-# Colonnes à ne jamais donner au modèle :
+-# - datetime        : identifiant temporel
+-# - target_pm25_48h : la cible
+-# - spike_48h       : dérivée directement de la cible (target > seuil),
+-#                     donc fuite de cible si on la garde en feature
+-EXCLUDED_COLUMNS = ["datetime", "target_pm25_48h", "spike_48h"]
++PARAMS = {
++    "n_estimators": 300,
++    "learning_rate": 0.05,
++    "max_depth": 6,
++    "subsample": 0.8,
++    "colsample_bytree": 0.8,
++    "objective": "reg:squarederror",
++    "random_state": 42,
++}
+ 
+ 
+-def load_data(path="data/processed/train.csv"):
+-    df = pd.read_csv(path)
+-    df["datetime"] = pd.to_datetime(df["datetime"])
+-    return df.sort_values("datetime").reset_index(drop=True)
++def _slug(name):
++    return name.split(" (")[0].lower().replace(" ", "_")
+ 
+ 
+ def train_model(df):
+-    # Découpage chronologique : le test est strictement postérieur
+-    # à l'entraînement (aucun shuffle, série temporelle)
+-    split_index = int(len(df) * 0.8)
+-
+-    train = df.iloc[:split_index]
+-    test = df.iloc[split_index:]
++    setup_mlflow()
++    train, test = chronological_split(df)
++    cols = feature_columns(df)
+ 
+-    print(
+-        f"Train : {len(train)} h "
+-        f"({train['datetime'].min():%Y-%m-%d} -> {train['datetime'].max():%Y-%m-%d})"
+-    )
+-    print(
+-        f"Test  : {len(test)} h "
+-        f"({test['datetime'].min():%Y-%m-%d} -> {test['datetime'].max():%Y-%m-%d})"
+-    )
++    X_train, y_train = train[cols], train["target_pm25_48h"]
++    X_test, y_test = test[cols], test["target_pm25_48h"]
+ 
+-    X_train = train.drop(columns=EXCLUDED_COLUMNS)
+-    y_train = train["target_pm25_48h"]
++    with mlflow.start_run(run_name="xgboost-regressor") as run:
++        mlflow.set_tags({"task": "regression", "target": "pm25_48h"})
++        mlflow.log_params(PARAMS)
++        mlflow.log_params({
++            "train_rows": len(train),
++            "test_rows": len(test),
++            "train_start": f"{train['datetime'].min():%Y-%m-%d}",
++            "train_end": f"{train['datetime'].max():%Y-%m-%d}",
++            "test_end": f"{test['datetime'].max():%Y-%m-%d}",
++            "n_features": len(cols),
++        })
+ 
+-    X_test = test.drop(columns=EXCLUDED_COLUMNS)
+-    y_test = test["target_pm25_48h"]
++        model = XGBRegressor(**PARAMS)
++        model.fit(X_train, y_train)
++        preds = model.predict(X_test)
+ 
+-    model = XGBRegressor(
+-        n_estimators=300,
+-        learning_rate=0.05,
+-        max_depth=6,
+-        subsample=0.8,
+-        colsample_bytree=0.8,
+-        objective="reg:squarederror",
+-        random_state=42,
+-    )
++        scores = regression_scores(y_test, preds)
++        mlflow.log_metrics({f"test_{k.lower()}": v for k, v in scores.items()})
+ 
+-    model.fit(X_train, y_train)
++        baselines = regression_baselines(train, test)
++        for name, base in baselines.items():
++            mlflow.log_metric(f"baseline_{_slug(name)}_mae", base["MAE"])
++        best_baseline_mae = min(b["MAE"] for b in baselines.values())
++        mlflow.set_tag("beats_best_baseline_mae", str(scores["MAE"] < best_baseline_mae))
+ 
+-    preds = model.predict(X_test)
++        mlflow.xgboost.log_model(
++            model,
++            name="model",
++            signature=infer_signature(X_test, preds),
++            input_example=X_test.head(3),
++            registered_model_name=REGRESSOR_NAME,
++        )
+ 
+-    mae = mean_absolute_error(y_test, preds)
+-    rmse = np.sqrt(mean_squared_error(y_test, preds))
+-    r2 = r2_score(y_test, preds)
++        print(f"MAE {scores['MAE']:.2f} | RMSE {scores['RMSE']:.2f} | R2 {scores['R2']:.3f}")
++        print(f"Meilleure baseline MAE : {best_baseline_mae:.2f}")
++        print(f"Run MLflow : {run.info.run_id}")
+ 
+-    print(f"MAE  : {mae:.2f}")
+-    print(f"RMSE : {rmse:.2f}")
+-    print(f"R2   : {r2:.3f}")
++    return model, scores
+ 
+-    # Baseline de persistance sur le même jeu de test, pour situer le modèle
+-    baseline_mae = mean_absolute_error(y_test, test["pm25"])
+-    print(f"Baseline persistance MAE : {baseline_mae:.2f}")
+ 
+-    joblib.dump(model, "models/xgboost_pm25_48h.pkl")
+-    print("Modele sauvegarde dans models/xgboost_pm25_48h.pkl")
++def run():
++    train_model(load_data())
+ 
+ 
+ if __name__ == "__main__":
+-    df = load_data()
+-    train_model(df)
++    run()
+diff --git a/src/models/train_classifier.py b/src/models/train_classifier.py
+index 1e6d137..ab47b35 100644
+--- a/src/models/train_classifier.py
++++ b/src/models/train_classifier.py
+@@ -1,82 +1,106 @@
+-import pandas as pd
+-import joblib
++"""Entraînement du classifieur de pics de pollution à 48 h, tracé dans MLflow.
+ 
+-from sklearn.metrics import confusion_matrix
+-from xgboost import XGBClassifier
+-from sklearn.metrics import (
+-    accuracy_score,
+-    precision_score,
+-    recall_score,
+-    f1_score,
+-    classification_report,
+-)
++Même principe que train.py : métriques, baselines sur le même jeu de test,
++nouvelle version candidate dans le Model Registry. La promotion en
++production est décidée par src/models/promote.py.
+ 
++Usage : python -m src.models.train_classifier
++"""
+ 
+-def load_data(path="data/processed/train.csv"):
+-    return pd.read_csv(path)
+-
++import mlflow
++import mlflow.xgboost
++from mlflow.models import infer_signature
++from sklearn.metrics import confusion_matrix
++from xgboost import XGBClassifier
+ 
+-def train_classifier(df):
++from src.models.baseline import classification_baselines
++from src.models.common import (
++    SPIKE_THRESHOLD_PROBA,
++    chronological_split,
++    classification_scores,
++    feature_columns,
++    load_data,
++)
++from src.tracking import CLASSIFIER_NAME, setup_mlflow
+ 
+-    split_index = int(len(df) * 0.8)
++PARAMS = {
++    "n_estimators": 300,
++    "learning_rate": 0.05,
++    "max_depth": 6,
++    "subsample": 0.8,
++    "colsample_bytree": 0.8,
++    "random_state": 42,
++    "eval_metric": "logloss",
++}
+ 
+-    train = df.iloc[:split_index]
+-    test = df.iloc[split_index:]
+ 
+-    X_train = train.drop(
+-        columns=["datetime", "target_pm25_48h", "spike_48h"]
+-    )
++def _slug(name):
++    return name.split(" (")[0].lower().replace(" ", "_").replace('"', "")
+ 
+-    y_train = train["spike_48h"]
+ 
+-    X_test = test.drop(
+-        columns=["datetime", "target_pm25_48h", "spike_48h"]
+-    )
++def train_classifier(df):
++    setup_mlflow()
++    train, test = chronological_split(df)
++    cols = feature_columns(df)
+ 
+-    y_test = test["spike_48h"]
++    X_train, y_train = train[cols], train["spike_48h"]
++    X_test, y_test = test[cols], test["spike_48h"]
+ 
+-    scale_pos_weight = len(y_train[y_train == 0]) / len(y_train[y_train == 1])
++    # Classes déséquilibrées (~12 % de pics) : on repondère les pics
++    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+ 
+-    print("scale_pos_weight:", scale_pos_weight)
++    with mlflow.start_run(run_name="xgboost-spike-classifier") as run:
++        mlflow.set_tags({"task": "classification", "target": "spike_48h"})
++        mlflow.log_params(PARAMS)
++        mlflow.log_params({
++            "scale_pos_weight": round(float(scale_pos_weight), 3),
++            "decision_threshold": SPIKE_THRESHOLD_PROBA,
++            "train_rows": len(train),
++            "test_rows": len(test),
++            "train_end": f"{train['datetime'].max():%Y-%m-%d}",
++            "test_end": f"{test['datetime'].max():%Y-%m-%d}",
++            "spike_rate_test": round(float(y_test.mean()), 4),
++        })
+ 
+-    model = XGBClassifier(
+-    n_estimators=300,
+-    learning_rate=0.05,
+-    max_depth=6,
+-    subsample=0.8,
+-    colsample_bytree=0.8,
+-    random_state=42,
+-    eval_metric="logloss",
+-    scale_pos_weight=scale_pos_weight
+-    )
++        model = XGBClassifier(**PARAMS, scale_pos_weight=scale_pos_weight)
++        model.fit(X_train, y_train)
+ 
+-    model.fit(X_train, y_train)
++        probs = model.predict_proba(X_test)[:, 1]
++        preds = (probs >= SPIKE_THRESHOLD_PROBA).astype(int)
+ 
++        scores = classification_scores(y_test, preds)
++        mlflow.log_metrics({f"test_{k.lower()}": v for k, v in scores.items()})
+ 
+-    probs = model.predict_proba(X_test)[:, 1]
++        baselines = classification_baselines(df, test)
++        for name, base in baselines.items():
++            mlflow.log_metric(f"baseline_{_slug(name)}_f1", base["F1"])
++            mlflow.log_metric(f"baseline_{_slug(name)}_recall", base["Recall"])
++        best_baseline_f1 = max(b["F1"] for b in baselines.values())
++        mlflow.set_tag("beats_best_baseline_f1", str(scores["F1"] > best_baseline_f1))
+ 
+-    threshold = 0.30
+-    preds = (probs >= threshold).astype(int)
++        tn, fp, fn, tp = confusion_matrix(y_test, preds).ravel()
++        mlflow.log_metrics({"test_tp": tp, "test_fp": fp, "test_fn": fn, "test_tn": tn})
+ 
+-    accuracy = accuracy_score(y_test, preds)
+-    precision = precision_score(y_test, preds)
+-    recall = recall_score(y_test, preds)
+-    f1 = f1_score(y_test, preds)
++        mlflow.xgboost.log_model(
++            model,
++            name="model",
++            signature=infer_signature(X_test, probs),
++            input_example=X_test.head(3),
++            registered_model_name=CLASSIFIER_NAME,
++        )
+ 
+-    print(f"Accuracy : {accuracy:.3f}")
+-    print(f"Precision: {precision:.3f}")
+-    print(f"Recall   : {recall:.3f}")
+-    print(f"F1-score : {f1:.3f}")
+-    print(confusion_matrix(y_test, preds))
++        print(
++            f"Precision {scores['Precision']:.3f} | Recall {scores['Recall']:.3f} "
++            f"| F1 {scores['F1']:.3f} (meilleure baseline F1 : {best_baseline_f1:.3f})"
++        )
++        print(f"Run MLflow : {run.info.run_id}")
+ 
+-    print("\nClassification Report:\n")
+-    print(classification_report(y_test, preds))
++    return model, scores
+ 
+-    joblib.dump(model, "models/xgboost_spike_classifier.pkl")
+ 
+-    print("✅ Classifier sauvegardé")
++def run():
++    train_classifier(load_data())
+ 
+ 
+ if __name__ == "__main__":
+-    df = load_data()
+-    train_classifier(df)
+\ No newline at end of file
++    run()
+diff --git a/src/tracking.py b/src/tracking.py
+new file mode 100644
+index 0000000..4b09680
+--- /dev/null
++++ b/src/tracking.py
+@@ -0,0 +1,22 @@
++"""Configuration MLflow commune à tout le projet.
++
++En local, sans serveur : base SQLite `mlflow.db` à la racine du projet
++(le Model Registry exige une base de données, pas un simple dossier).
++Avec le serveur Docker : MLFLOW_TRACKING_URI=http://mlflow:5000.
++"""
++
++import os
++
++import mlflow
++from mlflow import MlflowClient
++
++EXPERIMENT_NAME = "air-pollution-48h"
++REGRESSOR_NAME = "pm25-48h-regressor"
++CLASSIFIER_NAME = "pm25-spike-classifier"
++CHAMPION_ALIAS = "champion"
++
++
++def setup_mlflow():
++    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db"))
++    mlflow.set_experiment(EXPERIMENT_NAME)
++    return MlflowClient()
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+new file mode 100644
+index 0000000..48fc586
+--- /dev/null
++++ b/tests/test_pipeline.py
+@@ -0,0 +1,31 @@
++"""Fenêtre d'ingestion et structure du DAG Airflow."""
++
++from datetime import date
++
++import pytest
++
++from src.data.ingestion import ARCHIVE_DELAY_DAYS, HISTORY_DAYS, date_window
++
++
++def test_date_window_is_reproducible_and_complete():
++    start, end = date_window(date(2026, 10, 17))
++    assert end == date(2026, 10, 10)  # 7 jours de délai d'archive
++    assert (end - start).days + 1 == HISTORY_DAYS
++    assert (date(2026, 10, 17) - end).days == ARCHIVE_DELAY_DAYS
++
++
++def test_dag_structure():
++    pytest.importorskip("airflow")
++    from airflow.models.dagbag import DagBag
++
++    bag = DagBag(dag_folder="dags", include_examples=False)
++    assert bag.import_errors == {}
++    dag = bag.dags["air_pollution_retraining"]
++
++    upstream = {t.task_id: t.upstream_task_ids for t in dag.tasks}
++    assert upstream["validate"] == {"transform"}
++    assert upstream["train_regressor"] == {"validate"}
++    assert upstream["train_classifier"] == {"validate"}
++    # Aucune promotion sans rapport de baselines à jour
++    assert upstream["promote_regressor"] == {"baseline_report"}
++    assert upstream["promote_classifier"] == {"baseline_report"}
+diff --git a/tests/test_promotion.py b/tests/test_promotion.py
+new file mode 100644
+index 0000000..c1669bf
+--- /dev/null
++++ b/tests/test_promotion.py
+@@ -0,0 +1,25 @@
++"""Règle de promotion : un modèle ne passe en production que s'il bat
++la meilleure baseline ET le champion en place."""
++
++import pytest
++
++from src.models.promote import should_promote
++
++
++@pytest.mark.parametrize(
++    "candidate, baseline, champion, higher, expected",
++    [
++        # F1 (plus haut = mieux)
++        (0.35, 0.30, None, True, True),    # premier modèle, bat la baseline
++        (0.28, 0.30, None, True, False),   # ne bat pas la baseline
++        (0.35, 0.30, 0.36, True, False),   # moins bon que le champion
++        (0.35, 0.30, 0.35, True, False),   # égalité : on garde le champion
++        (0.37, 0.30, 0.36, True, True),    # bat baseline et champion
++        # MAE (plus bas = mieux)
++        (5.90, 5.76, None, False, False),  # cas réel du régresseur actuel
++        (5.50, 5.76, 5.60, False, True),
++    ],
++)
++def test_should_promote(candidate, baseline, champion, higher, expected):
++    promoted, _ = should_promote(candidate, baseline, champion, higher)
++    assert promoted is expected
+-- 
+2.43.0
+
