@@ -91,7 +91,7 @@ def root():
 @app.post("/predict-regression")
 def predict_regression(features: PollutionFeatures):
 
-    data = pd.DataFrame([features.dict()])
+    data = pd.DataFrame([features.model_dump()])
 
     prediction = regression_model.predict(data)[0]
 
@@ -107,7 +107,7 @@ def predict_regression(features: PollutionFeatures):
 @app.post("/predict-spike")
 def predict_spike(features: PollutionFeatures):
 
-    data = pd.DataFrame([features.dict()])
+    data = pd.DataFrame([features.model_dump()])
 
     probability = classifier_model.predict_proba(data)[0][1]
 

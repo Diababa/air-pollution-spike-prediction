@@ -6,21 +6,16 @@ An end-to-end Machine Learning system designed to predict air pollution spikes 4
 
 # 🚀 Live Demo
 
-## 🌐 Streamlit Dashboard
+| Service | URL |
+| ------- | --- |
+| 🌐 Streamlit Dashboard | [air-pollution-dashboard.onrender.com](https://air-pollution-dashboard.onrender.com) |
+| ⚡ FastAPI Backend | [air-pollution-api.onrender.com](https://air-pollution-api.onrender.com) |
+| 📖 Interactive API docs | [air-pollution-api.onrender.com/docs](https://air-pollution-api.onrender.com/docs) |
 
-
-
-```text
-https://air-pollution-dashboard.onrender.com
-```
-
-## ⚡ FastAPI Backend
-
-
-
-```text
-https://air-pollution-api.onrender.com
-```
+> ⏳ **Cold start warning.** Both services run on Render's free tier, which puts a
+> container to sleep after 15 minutes without traffic. The **first request wakes it
+> up and can take 50 to 60 seconds** (measured: 52 s). The link is not broken — it
+> is booting. Reload once and everything responds normally.
 
 ---
 
@@ -41,9 +36,11 @@ The system includes:
 ✅ Feature engineering for time-series forecasting
 ✅ XGBoost regression and classification models
 ✅ Rare-event spike detection
+✅ Naive baselines to put every metric in context
 ✅ Explainability with SHAP
 ✅ FastAPI model serving
 ✅ Streamlit interactive dashboard
+✅ Test suite and GitHub Actions CI
 ✅ Dockerized deployment
 ✅ Cloud deployment on Render
 
@@ -63,8 +60,7 @@ The system includes:
 ## Explainability
 ![Explainability](assets/screenshots/explainability.png)
 
-
-
+---
 
 # 🏗️ System Architecture
 
@@ -128,8 +124,26 @@ Features:
 
 ## ⏱️ Time Coverage
 
-* 3 years of hourly observations
-* ~26,000 rows
+* hourly observations from **2023-05-04 to 2026-04-24**
+* 26,088 rows after feature engineering and NaN removal
+
+---
+
+# 🧪 Evaluation Protocol
+
+This is a time-series problem, so the evaluation is built to avoid temporal leakage:
+
+* **Chronological 80 / 20 split — no shuffling, no random K-fold.**
+  Training covers 20,870 hours (2023-05-04 → 2025-09-19), the test set covers the
+  5,218 hours that follow (2025-09-19 → 2026-04-24). The models are never evaluated
+  on a period they have seen.
+* **No target-derived feature.** `spike_48h` is computed from `target_pm25_48h`, so
+  it is excluded from the feature set of both models. A test in
+  [tests/test_models.py](tests/test_models.py) asserts this invariant on every saved
+  model, so the leak cannot come back silently.
+* **Every metric is compared to a naive baseline** on the exact same test set.
+  Regenerate the full comparison with `python -m src.models.baseline`
+  → [reports/baseline_comparison.md](reports/baseline_comparison.md).
 
 ---
 
@@ -143,42 +157,59 @@ Regression model predicting PM2.5 concentration 48 hours ahead.
 
 * XGBoost Regressor
 
-### Metrics
+### Results vs baselines
 
-| Metric | Result |
-| ------ | ------ |
-| MAE    | 4.05   |
-| RMSE   | 5.13   |
-| R²     | 0.584  |
+| Model | MAE | RMSE | R² |
+| ----- | --- | ---- | -- |
+| Persistence (PM2.5 in 48h = PM2.5 now) | 6.57 | 9.41 | -0.400 |
+| Smoothed persistence (24h rolling mean) | 6.59 | 9.10 | -0.311 |
+| Climatology (training mean) | 5.76 | 8.02 | -0.018 |
+| **XGBoost Regressor** | **5.90** | **7.93** | **0.005** |
 
----
+**Reading these numbers honestly:** the model cuts RMSE by 16 % against the naive
+persistence rule (9.41 → 7.93) and is the only candidate with a non-negative R².
+But it does **not** beat a plain climatology baseline on MAE (5.90 vs 5.76). At a
+48-hour horizon, with only past observations and no weather *forecast* as input,
+predicting an exact hourly concentration is close to the ceiling of this feature
+set. That is why the operational value of the system sits in the task below.
 
 ## 2. Pollution Spike Detection
 
-Binary classification task predicting whether a severe pollution spike will occur within 48 hours.
+Binary classification predicting whether a severe pollution spike — PM2.5 above the
+90th percentile, 20.3 µg/m³ — will occur within 48 hours. Spikes represent 12.2 % of
+the test set.
 
 ### Model
 
-* XGBoost Classifier
+* XGBoost Classifier, `scale_pos_weight` for class imbalance, decision threshold 0.30
 
-### Metrics
+### Results vs baselines
 
-| Metric    | Result |
-| --------- | ------ |
-| Accuracy  | 0.736  |
-| Precision | 0.248  |
-| Recall    | 0.575  |
-| F1-score  | 0.347  |
+| Model | Accuracy | Precision | Recall | F1 |
+| ----- | -------- | --------- | ------ | -- |
+| Spike persistence (spike now → spike in 48h) | 0.830 | 0.303 | 0.303 | 0.303 |
+| Always "no spike" (majority class) | 0.878 | 0.000 | 0.000 | 0.000 |
+| **XGBoost Classifier (threshold 0.30)** | 0.736 | 0.248 | **0.575** | **0.347** |
+
+**Reading these numbers honestly:** the classifier catches **57.5 % of severe events
+against 30.3 % for the naive rule** — nearly twice as many — and improves F1 (0.347
+vs 0.303). Its accuracy is *lower* than the majority-class baseline, and that is
+expected: on a 12 % positive class, answering "never a spike" scores 0.878 accuracy
+while catching zero events. Accuracy is the wrong metric for this task.
 
 ### Business Optimization
 
-The classification threshold was intentionally optimized for recall to reduce missed severe pollution events.
+The decision threshold was lowered to 0.30 to trade precision for recall: for a
+public-health alert, a missed pollution spike costs far more than a false alarm.
+On the test set this operating point catches 366 of the 636 real spikes at the cost
+of 1,110 false alarms — roughly 3 false alarms per event caught. An explicit,
+tunable trade-off rather than a default.
 
 ---
 
 # ⚙️ Feature Engineering
 
-The project includes advanced time-series feature engineering:
+All features are built in [src/data/transformation.py](src/data/transformation.py).
 
 ## Lag Features
 
@@ -221,7 +252,8 @@ The project includes advanced time-series feature engineering:
 
 # 🧠 Explainable AI
 
-The system integrates SHAP explainability to understand which variables influence pollution spike predictions.
+The system integrates SHAP explainability to understand which variables influence
+pollution spike predictions ([src/models/explainability.py](src/models/explainability.py)).
 
 Top influencing features include:
 
@@ -253,6 +285,10 @@ POST /predict-regression
 POST /predict-spike
 ```
 
+Both prediction endpoints expect the 29 engineered features defined by the
+`PollutionFeatures` schema. Interactive documentation is available at
+[`/docs`](https://air-pollution-api.onrender.com/docs).
+
 ---
 
 # 📊 Streamlit Dashboard
@@ -264,6 +300,25 @@ The dashboard includes:
 ✅ Real-time prediction interface
 ✅ SHAP explainability visualization
 ✅ Interactive UI
+
+---
+
+# ✅ Tests & CI
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests -q
+```
+
+The suite covers the API contract (health check, both prediction endpoints, input
+validation) and two model invariants that protect against regressions actually hit
+during development:
+
+* the features expected by each saved model must match the API schema exactly;
+* no model may consume a column derived from the target.
+
+[GitHub Actions](.github/workflows/ci-cd.yml) runs the tests, regenerates the
+baseline comparison and builds both Docker images on every push to `main`.
 
 ---
 
@@ -287,6 +342,8 @@ Deployed on Render using separate services:
 
 * FastAPI backend service
 * Streamlit frontend service
+
+Free tier, so expect the cold start described in the [Live Demo](#-live-demo) section.
 
 ---
 
@@ -319,6 +376,7 @@ Deployed on Render using separate services:
 * Docker
 * Docker Compose
 * Render
+* GitHub Actions
 
 ---
 
@@ -328,26 +386,33 @@ Deployed on Render using separate services:
 ml-project/
 │
 ├── dashboard/
-│   └── app.py
+│   └── app.py                       # Streamlit UI
 │
 ├── data/
-│   ├── raw/
-│   └── processed/
+│   ├── raw/                         # Ingested pollution + weather data
+│   └── processed/                   # Feature-engineered dataset
 │
 ├── models/
-│   ├── xgboost_pm25_48h.pkl
-│   └── xgboost_spike_classifier.pkl
+│   ├── xgboost_pm25_48h.pkl         # Regressor: PM2.5 in 48h
+│   └── xgboost_spike_classifier.pkl # Classifier: spike in 48h
+│
+├── reports/
+│   └── baseline_comparison.md       # Generated metric comparison
 │
 ├── src/
-│   ├── api/
-│   ├── data/
-│   ├── models/
-│   └── utils/
+│   ├── api/app.py                   # FastAPI service
+│   ├── data/                        # Ingestion, validation, transformation
+│   └── models/                      # train, train_classifier, baseline, explainability
 │
+├── tests/                           # API contract + model invariants
+│
+├── .github/workflows/ci-cd.yml
+├── .env.example
 ├── Dockerfile.api
 ├── Dockerfile.dashboard
 ├── docker-compose.yml
 ├── requirements.txt
+├── requirements-dev.txt
 └── README.md
 ```
 
@@ -358,8 +423,8 @@ ml-project/
 ## Clone repository
 
 ```bash
-git clone <your-repository-url>
-cd ml-project
+git clone https://github.com/Diababa/air-pollution-spike-prediction.git
+cd air-pollution-spike-prediction
 ```
 
 ## Create virtual environment
@@ -388,6 +453,15 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Configure environment
+
+```bash
+cp .env.example .env
+```
+
+No API key is required: pollution and weather data come from the public Open-Meteo
+APIs. The only variable is `API_URL`, the prediction endpoint called by the dashboard.
+
 ---
 
 # ▶️ Run Locally
@@ -404,6 +478,16 @@ python -m uvicorn src.api.app:app --reload
 streamlit run dashboard/app.py
 ```
 
+## Reproduce the pipeline
+
+```bash
+python -m src.data.transformation      # build the feature dataset
+python -m src.models.train             # train the regressor
+python -m src.models.train_classifier  # train the spike classifier
+python -m src.models.baseline          # compare models vs naive baselines
+python -m src.models.explainability    # compute SHAP feature importance
+```
+
 ---
 
 # 🐳 Run with Docker
@@ -416,14 +500,17 @@ docker compose up --build
 
 # 📈 Future Improvements
 
-Potential next steps:
+Ranked by expected impact on the weakest part of the system, the 48h point forecast:
 
-* LSTM / Deep Learning forecasting
+* **Add weather forecasts as input features** — currently only *past* weather is
+  used; this is the main lever for beating the climatology baseline
+* **Predict a 48h window average or an anomaly** instead of an exact hourly value,
+  a target far less dominated by noise
+* Walk-forward (rolling-origin) cross-validation instead of a single split
+* Probabilistic forecasting with prediction intervals
 * MLflow experiment tracking
 * Drift monitoring
 * Airflow orchestration
-* Kubernetes deployment
-* Real-time streaming ingestion
 * Multi-city forecasting
 
 ---

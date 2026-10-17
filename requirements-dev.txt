@@ -1,0 +1,4 @@
+# Dépendances de développement / CI uniquement
+-r requirements.txt
+pytest
+httpx
