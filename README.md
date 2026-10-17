@@ -134,9 +134,10 @@ Features:
 This is a time-series problem, so the evaluation is built to avoid temporal leakage:
 
 * **Chronological 80 / 20 split — no shuffling, no random K-fold.**
-  Training covers 20,870 hours (2023-05-04 → 2025-09-19), the test set covers the
-  5,218 hours that follow (2025-09-19 → 2026-04-24). The models are never evaluated
-  on a period they have seen.
+  Data: 3 years of hourly observations ending 7 days before the run (sliding window).
+  On the latest run, training covers 20,851 hours (2023-10-19 → 2026-03-05) and the
+  test set the 5,213 hours that follow (2026-03-05 → 2026-10-08). The models are
+  never evaluated on a period they have seen.
 * **No target-derived feature.** `spike_48h` is computed from `target_pm25_48h`, so
   it is excluded from the feature set of both models. A test in
   [tests/test_models.py](tests/test_models.py) asserts this invariant on every saved
@@ -161,23 +162,23 @@ Regression model predicting PM2.5 concentration 48 hours ahead.
 
 | Model | MAE | RMSE | R² |
 | ----- | --- | ---- | -- |
-| Persistence (PM2.5 in 48h = PM2.5 now) | 6.57 | 9.41 | -0.400 |
-| Smoothed persistence (24h rolling mean) | 6.59 | 9.10 | -0.311 |
-| Climatology (training mean) | 5.76 | 8.02 | -0.018 |
-| **XGBoost Regressor** | **5.90** | **7.93** | **0.005** |
+| Persistence (PM2.5 in 48h = PM2.5 now) | 3.75 | 5.90 | -0.071 |
+| Smoothed persistence (24h rolling mean) | 3.88 | 6.00 | -0.108 |
+| Climatology (training mean) | 4.79 | 6.12 | -0.153 |
+| **XGBoost Regressor** | **3.39** | **5.10** | **0.198** |
 
-**Reading these numbers honestly:** the model cuts RMSE by 16 % against the naive
-persistence rule (9.41 → 7.93) and is the only candidate with a non-negative R².
-But it does **not** beat a plain climatology baseline on MAE (5.90 vs 5.76). At a
+**Reading these numbers honestly:** on this test window the model beats every
+baseline: MAE −9.5 % and RMSE −13.6 % against persistence, the best naive rule.
+An R² of 0.20 still means most of the hourly variance is not explained: at a
 48-hour horizon, with only past observations and no weather *forecast* as input,
-predicting an exact hourly concentration is close to the ceiling of this feature
-set. That is why the operational value of the system sits in the task below.
+an exact hourly concentration remains hard to predict. See also
+[Results depend on the test period](#results-depend-on-the-test-period).
 
 ## 2. Pollution Spike Detection
 
 Binary classification predicting whether a severe pollution spike — PM2.5 above the
-90th percentile, 20.3 µg/m³ — will occur within 48 hours. Spikes represent 12.2 % of
-the test set.
+90th percentile, 20.1 µg/m³ — will occur within 48 hours. Spikes represent only 4.3 %
+of the latest test set (spring–summer, a low-pollution season).
 
 ### Model
 
@@ -187,23 +188,37 @@ the test set.
 
 | Model | Accuracy | Precision | Recall | F1 |
 | ----- | -------- | --------- | ------ | -- |
-| Spike persistence (spike now → spike in 48h) | 0.830 | 0.303 | 0.303 | 0.303 |
-| Always "no spike" (majority class) | 0.878 | 0.000 | 0.000 | 0.000 |
-| **XGBoost Classifier (threshold 0.30)** | 0.736 | 0.248 | **0.575** | **0.347** |
+| Spike persistence (spike now → spike in 48h) | 0.947 | 0.404 | 0.482 | 0.440 |
+| Always "no spike" (majority class) | 0.957 | 0.000 | 0.000 | 0.000 |
+| **XGBoost Classifier (threshold 0.30)** | 0.949 | **0.420** | **0.504** | **0.458** |
 
-**Reading these numbers honestly:** the classifier catches **57.5 % of severe events
-against 30.3 % for the naive rule** — nearly twice as many — and improves F1 (0.347
-vs 0.303). Its accuracy is *lower* than the majority-class baseline, and that is
-expected: on a 12 % positive class, answering "never a spike" scores 0.878 accuracy
-while catching zero events. Accuracy is the wrong metric for this task.
+**Reading these numbers honestly:** on this window the classifier beats the naive
+rule on every metric, but **only marginally** (recall 50.4 % vs 48.2 %, F1 0.458 vs
+0.440). Accuracy is the wrong metric here: on a 4 % positive class, answering "never
+a spike" scores 0.957 while catching zero events.
 
 ### Business Optimization
 
 The decision threshold was lowered to 0.30 to trade precision for recall: for a
 public-health alert, a missed pollution spike costs far more than a false alarm.
-On the test set this operating point catches 366 of the 636 real spikes at the cost
-of 1,110 false alarms — roughly 3 false alarms per event caught. An explicit,
-tunable trade-off rather than a default.
+At a precision of 0.42, this operating point raises about 1.4 false alarms per
+spike caught on the latest test set (exact counts are logged in MLflow as
+`test_tp` / `test_fp` / `test_fn`). The threshold was chosen on the previous window
+and should be re-tuned with walk-forward evaluation. An explicit, tunable trade-off
+rather than a default.
+
+## Results depend on the test period
+
+| Test window | Season | Spike rate | Regressor vs best baseline (MAE) | Classifier recall vs persistence |
+| ----------- | ------ | ---------- | -------------------------------- | -------------------------------- |
+| 2025-09 → 2026-04 (previous run) | autumn–winter | 12.2 % | 5.90 vs 5.76 — **worse** | **57.5 % vs 30.3 %** |
+| 2026-03 → 2026-10 (latest run) | spring–summer | 4.3 % | **3.39 vs 3.75 — better** | 50.4 % vs 48.2 % |
+
+The same pipeline gives very different conclusions depending on which months fall
+in the test set: the classifier adds most value in the polluted season, the
+regressor in the calm one. A single chronological split is therefore not enough to
+judge these models. **Walk-forward evaluation over several origins is the next
+priority** (see [Future Improvements](#-future-improvements)).
 
 ---
 
@@ -355,10 +370,9 @@ promoted model is also exported to `models/*.json` (XGBoost's native, version-st
 format, rather than a pickle), which the API serves on Render.
 With `MODEL_SOURCE=mlflow`, the API loads the champion straight from the registry.
 
-> **Current status, stated honestly:** the spike classifier is promoted. The
-> regressor is **not**: its MAE does not beat the climatology baseline (see
-> [Results vs baselines](#results-vs-baselines)), so the rule keeps it out of
-> production. The regression endpoint still serves the last exported model.
+> **The rule has already blocked a model.** On the previous test window the
+> regressor did not beat the climatology baseline, so it would not have been
+> promoted. On the latest window both models beat their baselines and are champions.
 
 ## Weekly retraining (Airflow)
 
@@ -600,7 +614,8 @@ Ranked by expected impact on the weakest part of the system, the 48h point forec
   used; this is the main lever for beating the climatology baseline
 * **Predict a 48h window average or an anomaly** instead of an exact hourly value,
   a target far less dominated by noise
-* Walk-forward (rolling-origin) cross-validation instead of a single split
+* **Walk-forward (rolling-origin) evaluation instead of a single split** — the
+  latest run shows that conclusions flip with the season in the test set
 * Probabilistic forecasting with prediction intervals
 * Drift monitoring
 * Multi-city forecasting
